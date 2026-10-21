@@ -43,7 +43,9 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 # Waveshare e-Paper library (git submodule)
-set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/RaspberryPi_JetsonNano/c/lib/e-Paper)
+#set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/RaspberryPi_JetsonNano/c/lib/e-Paper)
+set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/STM32/STM32-F103ZET6/User/e-Paper)
+
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE

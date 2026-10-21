@@ -115,6 +115,7 @@ int main(void)
         printf("[FATAL] eink_demo_step failed; animation stopped\r\n");
         while (1) { HAL_Delay(1000); }
       }
+      HAL_Delay(300); // задержка между кадрами анимации
   }
   /* USER CODE END 3 */
 }
