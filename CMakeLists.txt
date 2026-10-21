@@ -42,14 +42,22 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
+# Waveshare e-Paper library (git submodule)
+set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/RaspberryPi_JetsonNano/c/lib/e-Paper)
+
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    Core/Src/DEV_Config.c
+    Core/Src/eink_demo.c
+    ${WS_EPAPER_LIB}/EPD_2in7_V2.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    Core/Inc
+    ${WS_EPAPER_LIB}
 )
 
 # Add project symbols (macros)

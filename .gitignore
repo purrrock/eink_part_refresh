@@ -1,0 +1,52 @@
+# Build output
+build/
+out/
+cmake-build-*/
+/compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+.ninja_log
+*.exe
+
+# IDE/editor
+.idea/
+*.user
+*.userosscache
+*.suo
+.vscode
+
+# STM32CubeIDE / Eclipse / расширение STM32Cube для VS Code
+.metadata/
+.settings/
+.cproject
+.project
+Debug/
+Release/
+STM32CubeIDE/
+
+# Generated/temporary files
+*.log
+*.tmp
+*.d
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+ai_project_dump.txt
+.clangd
+
+# Python caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+tests/data
