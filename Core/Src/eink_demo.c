@@ -9,6 +9,9 @@
  *      ТОЛЬКО из пикселей, которые реально изменились, и вызывает
  *      EPD_2IN7_V2_4Gray_PartialMask() (Core/Src/EPD_2in7_V2_4gray_partial.c):
  *      два прохода с собственным LUT, у пикселей вне маски нулевое напряжение.
+ *   3. Каждое EINK_FULL_REFRESH_EVERY-е обновление (по умолчанию 8-е) - полное
+ *      обновление всего экрана (Init_4GRAY + 4GrayDisplay), чтобы сбросить
+ *      накопленные остаточные следы и дрейф серых. Экран при этом мигает.
  *
  * Буфер кадра - в штатном формате Waveshare для 4 gray: 2 бита на пиксель,
  * 4 пикселя в байте, старший пиксель в старших битах, 44 байта на строку,
@@ -36,6 +39,12 @@
  *     если на границе треугольника остаются "шлейфы", попробуйте 1) */
 #ifndef EINK_MASK_FULL_RECT
 #define EINK_MASK_FULL_RECT 0
+#endif
+
+/* Каждое N-е обновление - полное (с миганием). 0 - никогда не делать полное.
+ * Обновления считаются после стартового полного: 1..N-1 частичные, N-е полное, ... */
+#ifndef EINK_FULL_REFRESH_EVERY
+#define EINK_FULL_REFRESH_EVERY 8
 #endif
 
 /* Шаг треугольника за одно обновление (px). Скорость ограничена временем update. */
@@ -72,6 +81,7 @@ static uint8_t mask[EPD_4GRAY_MASK_BYTES];  /* 1 бит/пиксель, 22 ба�
 
 static int s_x = 60, s_y = 50, s_dx = EINK_STEP_X, s_dy = EINK_STEP_Y;
 static uint32_t s_last_ms;
+static uint32_t s_upd_cnt;                  /* обновлений с последнего полного */
 
 /* ------------------------------ пиксели ----------------------------------- */
 
@@ -184,11 +194,33 @@ static void restore_from_bg(const nrect_t *r)
 
 /* ------------------------------ обновление -------------------------------- */
 
-/* Строит маску по отличиям cur от prev внутри rect и обновляет панель. */
+/* Полное обновление всего экрана штатными средствами Waveshare. Заново вызываем
+ * Init_4GRAY: частичные проходы меняли LUT, границу и адресные регистры. */
+static void full_refresh(void)
+{
+    uint32_t t0 = HAL_GetTick();
+    printf("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
+    EPD_2IN7_V2_Init_4GRAY();
+    EPD_2IN7_V2_4GrayDisplay(cur);
+    s_last_ms = HAL_GetTick() - t0;
+    printf("[UPDATE] FULL complete in %lu ms\r\n", (unsigned long)s_last_ms);
+}
+
+/* Строит маску по отличиям cur от prev внутри rect и обновляет панель.
+ * Каждое EINK_FULL_REFRESH_EVERY-е обновление вместо этого - полное. */
 static int push_diff(const nrect_t *r)
 {
     uint32_t t0 = HAL_GetTick();
     uint32_t changed = 0;
+
+    s_upd_cnt++;
+#if EINK_FULL_REFRESH_EVERY > 0
+    if (s_upd_cnt >= (uint32_t)EINK_FULL_REFRESH_EVERY) {
+        s_upd_cnt = 0;
+        full_refresh();
+        return 0;
+    }
+#endif
 
     memset(mask, 0, sizeof mask);
     for (int y = r->y0; y <= r->y1; y++) {
@@ -204,8 +236,8 @@ static int push_diff(const nrect_t *r)
             }
         }
     }
-    printf("[UPDATE] rect X=%d..%d Y=%d..%d, pixels in mask=%lu, mode=%s\r\n",
-           r->x0, r->x1, r->y0, r->y1, (unsigned long)changed,
+    printf("[UPDATE] #%lu rect X=%d..%d Y=%d..%d, pixels in mask=%lu, mode=%s\r\n",
+           (unsigned long)s_upd_cnt, r->x0, r->x1, r->y0, r->y1, (unsigned long)changed,
            EINK_MASK_FULL_RECT ? "full-rect" : "changed-only");
 
     if (changed == 0) {
@@ -238,8 +270,9 @@ int eink_demo_init(void)
     memcpy(cur, bg, IMG_SZ);
 
     printf("[INIT] full 4-gray refresh (stock Waveshare)\r\n");
-    EPD_2IN7_V2_4GrayDisplay(cur);          /* единственное полное обновление */
+    EPD_2IN7_V2_4GrayDisplay(cur);          /* стартовое полное обновление */
     memcpy(prev, cur, IMG_SZ);
+    s_upd_cnt = 0;
 
     /* первый кадр с треугольником - уже частичным обновлением */
     nrect_t r = rect_around(s_x, s_y);
