@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/DEV_Config.c
     Core/Src/eink_demo.c
+    Core/Src/EPD_2in7_V2_4gray_partial.c
     ${WS_EPAPER_LIB}/EPD_2in7_V2.c
 )
 

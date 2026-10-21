@@ -25,6 +25,7 @@
 #include "EPD_2in7_V2_4gray_partial.h"
 #include "Debug.h"
 #include <string.h>
+#include <stdint.h>
 
 /* Declared (non-static) in EPD_2in7_V2.c */
 extern UBYTE LUT_DATA_4Gray[159];
@@ -72,21 +73,33 @@ static void g_burst_end(void)
     DEV_Digital_Write(EPD_CS_PIN, 1);
 }
 
-static void g_busy(void)
+/* [TUNE] BUSY timeout. One pass lasts ~1 s; a stuck panel must not hang the MCU. */
+#define EPD_4GRAY_BUSY_TIMEOUT_MS  10000U
+
+static UBYTE s_timeout;
+
+/* returns 0 = ready, -1 = timeout */
+static int g_busy(void)
 {
-    do {
-        if (DEV_Digital_Read(EPD_BUSY_PIN) == 0) break;
-    } while (1);
+    uint32_t t0 = HAL_GetTick();
+    while (DEV_Digital_Read(EPD_BUSY_PIN) != 0) {       /* BUSY = 1 -> busy */
+        if ((uint32_t)(HAL_GetTick() - t0) >= EPD_4GRAY_BUSY_TIMEOUT_MS) {
+            s_timeout = 1;
+            return -1;
+        }
+        DEV_Delay_ms(1);
+    }
     DEV_Delay_ms(20);
+    return 0;
 }
 
 /* same as EPD_2IN7_V2_TurnOnDisplay_4GRAY: LUT from register, mode 1 */
-static void g_turn_on(void)
+static int g_turn_on(void)
 {
     g_cmd(0x22);
     g_data(0xC7);
     g_cmd(0x20);
-    g_busy();
+    return g_busy();
 }
 
 /* ------------------------------ LUT ------------------------------------ */
@@ -130,6 +143,8 @@ static void lut_build_draw(UBYTE *l)
 static void send_plane(UBYTE ram_cmd, const UBYTE *img, UBYTE bitsel,
                        const UBYTE *mask, UBYTE erase_pass)
 {
+    UBYTE row[BYTES_PER_ROW];
+
     g_cmd(ram_cmd);
     g_burst_begin();
     for (UWORD y = 0; y < EPD_2IN7_V2_HEIGHT; y++) {
@@ -150,8 +165,9 @@ static void send_plane(UBYTE ram_cmd, const UBYTE *img, UBYTE bitsel,
                 }
                 out = (UBYTE)((g & m) | (EPD_KEEP_FILL & (UBYTE)~m));
             }
-            DEV_SPI_WriteByte(out);
+            row[xb] = out;
         }
+        DEV_SPI_Write_nByte(row, BYTES_PER_ROW);
     }
     g_burst_end();
 }
@@ -178,39 +194,43 @@ static void send_setup_and_lut(const UBYTE *lut153)
 }
 
 /* ------------------------------ API ------------------------------------ */
-void EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask)
+int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask)
 {
     UBYTE lut[153];
+
+    s_timeout = 0;
 
     /* pass 1: masked pixels -> VSL extreme */
     lut_build_erase(lut);
     send_setup_and_lut(lut);
     send_plane(0x24, Image, 0, Mask, 1);
     send_plane(0x26, Image, 1, Mask, 1);
-    g_turn_on();
+    if (g_turn_on() != 0) return -1;
 
     /* pass 2: draw the grays of Image into the masked pixels */
     lut_build_draw(lut);
     send_setup_and_lut(lut);
     send_plane(0x24, Image, 0, Mask, 0);
     send_plane(0x26, Image, 1, Mask, 0);
-    g_turn_on();
+    if (g_turn_on() != 0) return -1;
+
+    return 0;
 }
 
-void EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
-                               UWORD Xstart, UWORD Ystart,
-                               UWORD Xend,   UWORD Yend)
+int EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
+                              UWORD Xstart, UWORD Ystart,
+                              UWORD Xend,   UWORD Yend)
 {
     static UBYTE mask[EPD_4GRAY_MASK_BYTES];
 
     if (Xend >= EPD_2IN7_V2_WIDTH)  Xend = EPD_2IN7_V2_WIDTH - 1;
     if (Yend >= EPD_2IN7_V2_HEIGHT) Yend = EPD_2IN7_V2_HEIGHT - 1;
-    if (Xstart > Xend || Ystart > Yend) return;
+    if (Xstart > Xend || Ystart > Yend) return 0;
 
     memset(mask, 0, sizeof mask);
     for (UWORD y = Ystart; y <= Yend; y++)
         for (UWORD x = Xstart; x <= Xend; x++)
             EPD_4GRAY_MASK_SET(mask, x, y);
 
-    EPD_2IN7_V2_4Gray_PartialMask(Image, mask);
+    return EPD_2IN7_V2_4Gray_PartialMask(Image, mask);
 }

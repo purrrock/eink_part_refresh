@@ -24,12 +24,13 @@
 #define EPD_4GRAY_MASK_SET(m, x, y) \
     ((m)[(UDOUBLE)(y) * (EPD_2IN7_V2_WIDTH / 8) + ((x) >> 3)] |= (UBYTE)(0x80 >> ((x) & 7)))
 
-/* Pixel-exact update: only masked pixels are redrawn. */
-void EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask);
+/* Pixel-exact update: only masked pixels are redrawn.
+ * Return: 0 = ok, -1 = BUSY timeout (10 s). Blocks ~1-2 s (two waveform passes). */
+int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask);
 
 /* Convenience: rectangle, coordinates INCLUSIVE (builds a mask internally). */
-void EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
-                               UWORD Xstart, UWORD Ystart,
-                               UWORD Xend,   UWORD Yend);
+int EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
+                              UWORD Xstart, UWORD Ystart,
+                              UWORD Xend,   UWORD Yend);
 
 #endif
