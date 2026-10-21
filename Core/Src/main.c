@@ -21,6 +21,7 @@
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -91,7 +92,16 @@ int main(void)
   MX_SPI1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  eink_demo_init();
+  printf("\r\n=== eink_part_refresh boot ===\r\n");
+  printf("[BOOT] SystemCoreClock=%lu Hz, HAL tick=%lu ms\r\n",
+         (unsigned long)SystemCoreClock, (unsigned long)HAL_GetTick());
+  printf("[BOOT] USART2=115200 8N1, SPI1 display interface initialized\r\n");
+  printf("[BOOT] EINK_BUSY PB2 level before panel init: %u\r\n",
+         (unsigned)HAL_GPIO_ReadPin(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin));
+  if (eink_demo_init() != 0) {
+    printf("[FATAL] eink_demo_init failed; animation stopped\r\n");
+    while (1) { HAL_Delay(1000); }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -101,7 +111,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	    eink_demo_step();
+      if (eink_demo_step() != 0) {
+        printf("[FATAL] eink_demo_step failed; animation stopped\r\n");
+        while (1) { HAL_Delay(1000); }
+      }
   }
   /* USER CODE END 3 */
 }
@@ -148,6 +161,22 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* printf() -> _write() in syscalls.c -> __io_putchar() -> USART2. */
+int __io_putchar(int ch)
+{
+  uint8_t byte;
+  if (ch == '\n') {
+    byte = '\r';
+    if (HAL_UART_Transmit(&huart2, &byte, 1, 1000) != HAL_OK) {
+      return EOF;
+    }
+  }
+  byte = (uint8_t)ch;
+  if (HAL_UART_Transmit(&huart2, &byte, 1, 1000) != HAL_OK) {
+    return EOF;
+  }
+  return ch;
+}
 
 /* USER CODE END 4 */
 

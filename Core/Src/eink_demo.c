@@ -16,6 +16,7 @@
 #include "DEV_Config.h"
 #include "EPD_2in7_V2.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ------------------------- настройки эксперимента ------------------------- */
 
@@ -198,13 +199,33 @@ static void epd_data1(uint8_t d)
     DEV_Digital_Write(EPD_CS_PIN, 1);
 }
 
-static void epd_wait_busy(void)
+static int epd_wait_busy(const char *operation)
 {
     uint32_t t0 = HAL_GetTick();
-    while (DEV_Digital_Read(EPD_BUSY_PIN)) {            /* BUSY = 1 - занят */
-        if (HAL_GetTick() - t0 > BUSY_TIMEOUT_MS) break;
+    uint32_t last_report = t0;
+    uint8_t busy = DEV_Digital_Read(EPD_BUSY_PIN);
+
+    printf("[BUSY] %s: wait start, pin=%u, timeout=%lu ms\r\n",
+           operation, (unsigned)busy, (unsigned long)BUSY_TIMEOUT_MS);
+    while (busy) {                                      /* BUSY = 1 - занят */
+        uint32_t now = HAL_GetTick();
+        if ((uint32_t)(now - t0) >= BUSY_TIMEOUT_MS) {
+            printf("[ERROR][BUSY] %s TIMEOUT after %lu ms; pin=%u\r\n",
+                   operation, (unsigned long)(now - t0),
+                   (unsigned)DEV_Digital_Read(EPD_BUSY_PIN));
+            return -1;
+        }
+        if ((uint32_t)(now - last_report) >= 1000U) {
+            printf("[BUSY] %s still busy after %lu ms\r\n",
+                   operation, (unsigned long)(now - t0));
+            last_report = now;
+        }
         DEV_Delay_ms(1);
+        busy = DEV_Digital_Read(EPD_BUSY_PIN);
     }
+    printf("[BUSY] %s ready after %lu ms\r\n", operation,
+           (unsigned long)(HAL_GetTick() - t0));
+    return 0;
 }
 
 static void epd_set_window(const nrect_t *r)
@@ -228,7 +249,7 @@ static void epd_set_cursor(const nrect_t *r)
     epd_data1((uint8_t)((r->y0 >> 8) & 0x01));
 }
 
-static void epd_write_plane(uint8_t cmd, const uint8_t *plane, const nrect_t *r)
+static int epd_write_plane(uint8_t cmd, const uint8_t *plane, const nrect_t *r)
 {
     uint16_t n = (uint16_t)(r->bx1 - r->bx0 + 1);
     epd_set_cursor(r);              /* счётчик адреса надо ставить перед каждой плоскостью */
@@ -236,51 +257,95 @@ static void epd_write_plane(uint8_t cmd, const uint8_t *plane, const nrect_t *r)
     DEV_Digital_Write(EPD_DC_PIN, 1);
     DEV_Digital_Write(EPD_CS_PIN, 0);
     for (int y = r->y0; y <= r->y1; y++) {
-        HAL_SPI_Transmit(&hspi1, (uint8_t *)&plane[(uint32_t)y * ROW_BYTES + r->bx0], n, 100);
+        HAL_StatusTypeDef status = HAL_SPI_Transmit(
+            &hspi1, (uint8_t *)&plane[(uint32_t)y * ROW_BYTES + r->bx0], n, 100);
+        if (status != HAL_OK) {
+            DEV_Digital_Write(EPD_CS_PIN, 1);
+            printf("[ERROR][SPI] plane 0x%02X row=%d bytes=%u status=%d, ErrorCode=0x%08lX\r\n",
+                   (unsigned)cmd, y, (unsigned)n, (int)status,
+                   (unsigned long)hspi1.ErrorCode);
+            return -1;
+        }
     }
     DEV_Digital_Write(EPD_CS_PIN, 1);
+    printf("[SPI] plane 0x%02X sent: rows=%d..%d, %u bytes/row, total=%lu bytes\r\n",
+           (unsigned)cmd, r->y0, r->y1, (unsigned)n,
+           (unsigned long)n * (unsigned long)(r->y1 - r->y0 + 1));
+    return 0;
 }
 
-static void push_window(nrect_t r)
+static int push_window(nrect_t r)
 {
     if (EINK_SEND_FULL_FRAME) {
         r.bx0 = 0; r.bx1 = ROW_BYTES - 1; r.y0 = 0; r.y1 = NAT_H - 1;
     }
     uint32_t t0 = HAL_GetTick();
 
+    printf("[UPDATE] begin rect bytes X=%d..%d, Y=%d..%d; ctrl2=0x%02X; mode=%s\r\n",
+           r.bx0, r.bx1, r.y0, r.y1, (unsigned)EINK_UPDATE_CTRL2,
+           EINK_SEND_FULL_FRAME ? "full-frame" : "window");
+
     epd_set_window(&r);
-    epd_write_plane(0x24, fr_a, &r);
-    epd_write_plane(0x26, fr_b, &r);
+    if (epd_write_plane(0x24, fr_a, &r) != 0) {
+        s_last_ms = HAL_GetTick() - t0;
+        return -1;
+    }
+    if (epd_write_plane(0x26, fr_b, &r) != 0) {
+        s_last_ms = HAL_GetTick() - t0;
+        return -1;
+    }
 
     epd_cmd(0x22);
     epd_data1(EINK_UPDATE_CTRL2);
     epd_cmd(0x20);
-    epd_wait_busy();
+    if (epd_wait_busy("display update") != 0) {
+        s_last_ms = HAL_GetTick() - t0;
+        printf("[ERROR][UPDATE] update failed after %lu ms; no next frame will be sent\r\n",
+               (unsigned long)s_last_ms);
+        return -1;
+    }
 
     s_last_ms = HAL_GetTick() - t0;
+    printf("[UPDATE] complete in %lu ms\r\n", (unsigned long)s_last_ms);
+    return 0;
 }
 
 /* --------------------------------- API ------------------------------------ */
 
-void eink_demo_init(void)
+int eink_demo_init(void)
 {
+    printf("[INIT] DEV_Module_Init()\r\n");
     DEV_Module_Init();
+    printf("[INIT] EPD_2IN7_V2_Init_4GRAY() begin; BUSY=%u\r\n",
+           (unsigned)DEV_Digital_Read(EPD_BUSY_PIN));
     EPD_2IN7_V2_Init_4GRAY();               /* сброс + загрузка 4-gray LUT (Waveshare) */
+    printf("[INIT] EPD_2IN7_V2_Init_4GRAY() returned; BUSY=%u\r\n",
+           (unsigned)DEV_Digital_Read(EPD_BUSY_PIN));
 
+    printf("[INIT] rendering %dx%d 4-gray background (%lu bytes per plane)\r\n",
+           LW, LH, (unsigned long)PLANE_SZ);
     render_background();
     memcpy(fr_a, bg_a, PLANE_SZ);
     memcpy(fr_b, bg_b, PLANE_SZ);
 
     nrect_t full = { 0, ROW_BYTES - 1, 0, NAT_H - 1 };
-    push_window(full);                      /* полная 4-gray отрисовка фона */
+    if (push_window(full) != 0) {
+        printf("[ERROR][INIT] full background update failed\r\n");
+        return -1;
+    }
 
     /* первый кадр с треугольником */
     nrect_t r = rect_around(s_x, s_y);
     draw_triangle(s_x, s_y);
-    push_window(r);
+    if (push_window(r) != 0) {
+        printf("[ERROR][INIT] initial triangle update failed\r\n");
+        return -1;
+    }
+    printf("[INIT] complete; initial triangle=(%d,%d)\r\n", s_x, s_y);
+    return 0;
 }
 
-void eink_demo_step(void)
+int eink_demo_step(void)
 {
     int ox = s_x, oy = s_y;
 
@@ -290,9 +355,15 @@ void eink_demo_step(void)
     if (s_y < 14 || s_y > LH - 15) { s_dy = -s_dy; s_y += 2 * s_dy; }
 
     nrect_t r = rect_union(rect_around(ox, oy), rect_around(s_x, s_y));
+    printf("[FRAME] triangle (%d,%d)->(%d,%d), dirty bytes X=%d..%d Y=%d..%d\r\n",
+           ox, oy, s_x, s_y, r.bx0, r.bx1, r.y0, r.y1);
     restore_from_bg(&r);
     draw_triangle(s_x, s_y);
-    push_window(r);
+    if (push_window(r) != 0) {
+        printf("[ERROR][FRAME] frame update failed; aborting animation\r\n");
+        return -1;
+    }
+    return 0;
 }
 
 uint32_t eink_demo_last_update_ms(void)
