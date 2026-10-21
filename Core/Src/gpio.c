@@ -46,11 +46,11 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, EINK_CS_Pin|EINK_DC_Pin|EINK_RST_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pin : EINK_BUSY_Pin */
+  GPIO_InitStruct.Pin = EINK_BUSY_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(EINK_BUSY_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : EINK_CS_Pin EINK_DC_Pin EINK_RST_Pin */
   GPIO_InitStruct.Pin = EINK_CS_Pin|EINK_DC_Pin|EINK_RST_Pin;
