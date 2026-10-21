@@ -194,16 +194,20 @@ static void restore_from_bg(const nrect_t *r)
 
 /* ------------------------------ обновление -------------------------------- */
 
-/* Полное обновление всего экрана штатными средствами Waveshare. Заново вызываем
- * Init_4GRAY: частичные проходы меняли LUT, границу и адресные регистры. */
-static void full_refresh(void)
+/* Полное обновление всего экрана. EPD_2IN7_V2_4Gray_Full() заново вызывает
+ * Init_4GRAY (частичные проходы меняли LUT, границу и адресные регистры) и грузит
+ * штатный LUT с укороченной "встряской" - см. EPD_FULL_SHAKE_RP. */
+static int full_refresh(void)
 {
     uint32_t t0 = HAL_GetTick();
     printf("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
-    EPD_2IN7_V2_Init_4GRAY();
-    EPD_2IN7_V2_4GrayDisplay(cur);
+    int rc = EPD_2IN7_V2_4Gray_Full(cur);   /* Init_4GRAY + укороченный LUT + кадр */
     s_last_ms = HAL_GetTick() - t0;
-    printf("[UPDATE] FULL complete in %lu ms\r\n", (unsigned long)s_last_ms);
+    if (rc != 0)
+        printf("[ERROR][UPDATE] FULL: BUSY timeout after %lu ms\r\n", (unsigned long)s_last_ms);
+    else
+        printf("[UPDATE] FULL complete in %lu ms\r\n", (unsigned long)s_last_ms);
+    return rc;
 }
 
 /* Строит маску по отличиям cur от prev внутри rect и обновляет панель.
@@ -217,8 +221,7 @@ static int push_diff(const nrect_t *r)
 #if EINK_FULL_REFRESH_EVERY > 0
     if (s_upd_cnt >= (uint32_t)EINK_FULL_REFRESH_EVERY) {
         s_upd_cnt = 0;
-        full_refresh();
-        return 0;
+        return full_refresh();
     }
 #endif
 

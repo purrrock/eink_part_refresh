@@ -26,6 +26,11 @@
 
 /* Pixel-exact update: only masked pixels are redrawn.
  * Return: 0 = ok, -1 = BUSY timeout (10 s). Blocks ~1-2 s (two waveform passes). */
+/* Full 4-gray refresh of the whole panel with a shortened shake group (see
+ * EPD_FULL_SHAKE_RP in the .c file). Does its own Init_4GRAY. Image = stock Waveshare
+ * 2 bpp buffer, 11616 bytes. Return: 0 = ok, -1 = BUSY timeout. */
+int EPD_2IN7_V2_4Gray_Full(const UBYTE *Image);
+
 int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask);
 
 /* Convenience: rectangle, coordinates INCLUSIVE (builds a mask internally). */

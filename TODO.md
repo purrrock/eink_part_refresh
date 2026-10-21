@@ -1,0 +1,36 @@
+Полное обновление ускорилось с 6374 ms до 4302 ms. Следов и искажений изображения нет. Но вместе с тем замедлилось частичное обновление с 2048 ms до 2448 ms.
+Вот лог:
+=== eink_part_refresh boot ===
+[BOOT] SystemCoreClock=16000000 Hz, HAL tick=4 ms
+[BOOT] USART2=115200 8N1, SPI1 display interface initialized
+[BOOT] EINK_BUSY PB2 level before panel init: 0
+[INIT] DEV_Module_Init()
+[INIT] EPD_2IN7_V2_Init_4GRAY(); BUSY=0
+[INIT] rendering 264x176 4-gray background (11616 bytes)
+[INIT] full 4-gray refresh (stock Waveshare)
+[UPDATE] #1 rect X=115..135 Y=50..70, pixels in mask=60, mode=changed-only
+[UPDATE] complete in 2448 ms
+[INIT] complete; initial triangle=(60,50)
+[FRAME] triangle (60,50)->(64,53)
+[UPDATE] #2 rect X=112..135 Y=50..74, pixels in mask=106, mode=changed-only
+[UPDATE] complete in 2449 ms
+[FRAME] triangle (64,53)->(68,56)
+[UPDATE] #3 rect X=109..132 Y=54..78, pixels in mask=122, mode=changed-only
+[UPDATE] complete in 2448 ms
+[FRAME] triangle (68,56)->(72,59)
+[UPDATE] #4 rect X=106..129 Y=58..82, pixels in mask=133, mode=changed-only
+[UPDATE] complete in 2448 ms
+[FRAME] triangle (72,59)->(76,62)
+[UPDATE] #5 rect X=103..126 Y=62..86, pixels in mask=151, mode=changed-only
+[UPDATE] complete in 2448 ms
+[FRAME] triangle (76,62)->(80,65)
+[UPDATE] #6 rect X=100..123 Y=66..90, pixels in mask=151, mode=changed-only
+[UPDATE] complete in 2450 ms
+[FRAME] triangle (80,65)->(84,68)
+[UPDATE] #7 rect X=97..120 Y=70..94, pixels in mask=143, mode=changed-only
+[UPDATE] complete in 2447 ms
+[FRAME] triangle (84,68)->(88,71)
+[UPDATE] FULL refresh (every 8-th update)
+[UPDATE] FULL complete in 4302 ms
+
+Этого допускать нельзя, частичное обновление должно быть как можно более быстрым. Исправь.

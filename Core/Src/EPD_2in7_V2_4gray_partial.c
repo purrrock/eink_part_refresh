@@ -20,7 +20,9 @@
 *   EPD_2IN7_V2_4GrayDisplay() writes, so which gray lands on which LUT row is
 *   the same as in the stock waveform.
 *
-* NOT TESTED ON HARDWARE. Tunables are marked [TUNE].
+* First hardware test: partial updates work without full-screen flashing, but
+* black was under-driven (ghosts that vanish after a full refresh), so T_ROW3 was
+* raised from the stock 25. Tunables are marked [TUNE].
 ******************************************************************************/
 #include "EPD_2in7_V2_4gray_partial.h"
 #include "Debug.h"
@@ -35,12 +37,40 @@ extern UBYTE LUT_DATA_4Gray[159];
  * 0xFF : use if the result looks inverted / the rectangle comes out wrong     */
 #define EPD_KEEP_FILL   0x00
 
-/* [TUNE] frames. Row 3 (black-most) / row 2 / row 1 as in the stock LUT. */
+/* [TUNE] frames. Every value can be overridden with -D<NAME>=<n> at build time.
+ * Row 3 (black) / row 2 / row 1 as in the stock LUT; they are the VSH pulse
+ * lengths that follow the erase, i.e. the cumulative "distance" from white.
+ * T_ROW3 must be long enough to bring a pixel from the erased state to full
+ * black. Too short -> black looks gray and leaves a light ghost where a black
+ * pixel was restored (this is what 25 produced on the first hardware test). */
+#ifndef T_ROW1
 #define T_ROW1   3
+#endif
+#ifndef T_ROW2
 #define T_ROW2   8
-#define T_ROW3   25
-#define T_ERASE  40   /* VSL pulse that must saturate from any gray; >= ~1.5*T_ROW3 */
+#endif
+#ifndef T_ROW3
+#define T_ROW3   45
+#endif
+#ifndef T_ERASE
+#define T_ERASE  40   /* VSL pulse that must saturate from any gray */
+#endif
+#ifndef T_ERASE_PRE
 #define T_ERASE_PRE 0 /* optional VSH pre-pulse before the erase, frames */
+#endif
+#ifndef T_ERASE_REP
+#define T_ERASE_REP 1 /* how many times (VSH pre + VSL erase) is repeated, 1..16 */
+#endif
+
+/* [TUNE] Full refresh (EPD_2IN7_V2_4Gray_Full): the stock 4-gray waveform is 262 frames
+ * (~23 ms each here, ~6 s). 168 of them are the "shake" group 1 (VSH 20 / VSL 20 / ...
+ * repeated RP+1 = 4 times). The shake is DC-balanced per repetition, so it can be shortened
+ * without changing the gray levels set by groups 0 and 2:
+ *   RP=3 stock (262 frames), RP=2 (220), RP=1 (178), RP=0 (136).
+ * Less shake = faster, but weaker ghost removal. */
+#ifndef EPD_FULL_SHAKE_RP
+#define EPD_FULL_SHAKE_RP  1
+#endif
 
 #define BYTES_PER_ROW   (EPD_2IN7_V2_WIDTH / 8)    /* 22 plane bytes / 44 image bytes */
 #define IMG_STRIDE      (EPD_2IN7_V2_WIDTH / 4)
@@ -122,7 +152,7 @@ static void lut_build_erase(UBYTE *l)
 {
     lut_base(l);
     l[3 * 12 + 0] = 0x60;                 /* row 3: A=VSH (pre), B=VSL */
-    lut_group(l, 0, T_ERASE_PRE, T_ERASE, 0, 0, 0);
+    lut_group(l, 0, T_ERASE_PRE, T_ERASE, 0, 0, T_ERASE_REP - 1);
 }
 
 static void lut_build_draw(UBYTE *l)
@@ -149,7 +179,7 @@ static void send_plane(UBYTE ram_cmd, const UBYTE *img, UBYTE bitsel,
     g_burst_begin();
     for (UWORD y = 0; y < EPD_2IN7_V2_HEIGHT; y++) {
         for (UWORD xb = 0; xb < BYTES_PER_ROW; xb++) {
-            UBYTE m = mask[(UDOUBLE)y * BYTES_PER_ROW + xb];
+            UBYTE m = mask ? mask[(UDOUBLE)y * BYTES_PER_ROW + xb] : 0xFF;   /* NULL = all */
             UBYTE out;
             if (m == 0) {
                 out = EPD_KEEP_FILL;                      /* nothing to do here */
@@ -215,6 +245,27 @@ int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask)
     if (g_turn_on() != 0) return -1;
 
     return 0;
+}
+
+int EPD_2IN7_V2_4Gray_Full(const UBYTE *Image)
+{
+    UBYTE lut[153];
+
+    s_timeout = 0;
+
+    EPD_2IN7_V2_Init_4GRAY();               /* stock: reset, registers, border 0, LUT, cursor 0 */
+
+    /* same LUT as stock, but with a shorter shake group 1 */
+    memcpy(lut, LUT_DATA_4Gray, 153);
+    lut[60 + 1 * 7 + 6] = EPD_FULL_SHAKE_RP;
+    g_cmd(0x32);
+    g_burst_begin();
+    DEV_SPI_Write_nByte(lut, 153);
+    g_burst_end();
+
+    send_plane(0x24, Image, 0, NULL, 0);    /* NULL mask = stock conversion of every pixel */
+    send_plane(0x26, Image, 1, NULL, 0);
+    return g_turn_on();
 }
 
 int EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
