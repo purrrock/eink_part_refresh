@@ -47,6 +47,12 @@
 #define EINK_FULL_REFRESH_EVERY 8
 #endif
 
+/* 1 - после каждого обновления печатать разбивку времени по фазам драйвера
+ * (нужно собрать драйвер с -DEPD_4GRAY_PROFILE, см. CMakeLists.txt) */
+#ifndef EINK_PROFILE
+#define EINK_PROFILE        0
+#endif
+
 /* Шаг треугольника за одно обновление (px). Скорость ограничена временем update. */
 #ifndef EINK_STEP_X
 #define EINK_STEP_X         4
@@ -194,14 +200,14 @@ static void restore_from_bg(const nrect_t *r)
 
 /* ------------------------------ обновление -------------------------------- */
 
-/* Полное обновление всего экрана. EPD_2IN7_V2_4Gray_Full() заново вызывает
- * Init_4GRAY (частичные проходы меняли LUT, границу и адресные регистры) и грузит
- * штатный LUT с укороченной "встряской" - см. EPD_FULL_SHAKE_RP. */
+/* Полное обновление всего экрана. EPD_2IN7_V2_4Gray_Full() сама загружает LUT, границу
+ * и адресные регистры (аппаратный сброс не нужен); встряска настраивается через
+ * EPD_FULL_SHAKE_RP / EPD_FULL_SHAKE_TP. */
 static int full_refresh(void)
 {
     uint32_t t0 = HAL_GetTick();
     printf("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
-    int rc = EPD_2IN7_V2_4Gray_Full(cur);   /* Init_4GRAY + укороченный LUT + кадр */
+    int rc = EPD_2IN7_V2_4Gray_Full(cur);   /* без аппаратного сброса, LUT с короткой встряской */
     s_last_ms = HAL_GetTick() - t0;
     if (rc != 0)
         printf("[ERROR][UPDATE] FULL: BUSY timeout after %lu ms\r\n", (unsigned long)s_last_ms);
@@ -214,7 +220,6 @@ static int full_refresh(void)
  * Каждое EINK_FULL_REFRESH_EVERY-е обновление вместо этого - полное. */
 static int push_diff(const nrect_t *r)
 {
-    uint32_t t0 = HAL_GetTick();
     uint32_t changed = 0;
 
     s_upd_cnt++;
@@ -247,13 +252,19 @@ static int push_diff(const nrect_t *r)
         s_last_ms = 0;
         return 0;
     }
-    if (EPD_2IN7_V2_4Gray_PartialMask(cur, mask) != 0) {
-        s_last_ms = HAL_GetTick() - t0;
+    uint32_t t0 = HAL_GetTick();            /* время только вызова драйвера */
+    int rc = EPD_2IN7_V2_4Gray_PartialMask(cur, mask);
+    s_last_ms = HAL_GetTick() - t0;
+    if (rc != 0) {
         printf("[ERROR][UPDATE] BUSY timeout after %lu ms\r\n", (unsigned long)s_last_ms);
         return -1;
     }
-    s_last_ms = HAL_GetTick() - t0;
     printf("[UPDATE] complete in %lu ms\r\n", (unsigned long)s_last_ms);
+#if EINK_PROFILE && defined(EPD_4GRAY_PROFILE)
+    printf("[PROF] setup1=%u spi1=%u wait1=%u spi2=%u wait2=%u ms\r\n",
+           epd_4gray_prof.setup1, epd_4gray_prof.spi1, epd_4gray_prof.wait1,
+           epd_4gray_prof.spi2, epd_4gray_prof.wait2);
+#endif
     return 0;
 }
 

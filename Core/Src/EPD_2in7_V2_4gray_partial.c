@@ -1,6 +1,6 @@
 /*****************************************************************************
 * | File     : EPD_2in7_V2_4gray_partial.c
-* | Function : EXPERIMENTAL partial refresh for the 4-gray mode, 2.7inch V2
+* | Function : partial and fast full refresh for the 4-gray mode, 2.7inch V2
 *
 * Why a special routine is needed
 *   The stock LUT_DATA_4Gray is an ABSOLUTE waveform: every pixel is shaken
@@ -9,20 +9,29 @@
 *   the 4 gray levels, so there is no "do not touch this pixel" code, and the
 *   0x20 trigger always updates the whole panel.
 *
-* What this file does (two partial-style passes, custom LUT in register 0x32)
-*   pass 1 ERASE: pixels of the dirty mask get row 3 = long VSL pulse
-*                 (-> VSL extreme); everything else gets row 0 = "keep"
-*                 (zero drive, row 0 is empty in both LUTs below).
-*   pass 2 DRAW : row 1/2/3 = VSH for 3/8/25 frames (exactly the final pulses
-*                 of the stock waveform); pixels of the target gray that maps
-*                 to row 0, and everything outside the rectangle, are "keep".
-*   The RAM bits written for a gray pixel are exactly the bits that
+* Partial update = two passes with a custom LUT in register 0x32.
+*   LUT row 0 is empty ("keep"): unmasked pixels are written as RAM pair (0,0).
+*
+*   pass 1 (T_ERASE / T_ROW3 frames, concurrently):
+*     masked pixel, target black                -> row 3: VSH  T_ROW3  frames
+*     masked pixel, any other target            -> rows 1/2: VSL T_ERASE frames
+*   pass 2 (T_ROW2 frames):
+*     masked pixel, target light / dark gray    -> rows 1/2: VSH T_ROW1 / T_ROW2
+*   Black and white are saturated extremes, so they do not depend on the old
+*   gray and need no erase first. Only the two intermediate grays have to start
+*   from white, which pass 1 provides. Total = max(T_ERASE,T_ROW3)+T_ROW2 frames
+*   (53 with the defaults) instead of T_ERASE+T_ROW3 (85) for erase-then-draw.
+*   The RAM bits of a gray pixel are exactly the bits that
 *   EPD_2IN7_V2_4GrayDisplay() writes, so which gray lands on which LUT row is
 *   the same as in the stock waveform.
 *
-* First hardware test: partial updates work without full-screen flashing, but
-* black was under-driven (ghosts that vanish after a full refresh), so T_ROW3 was
-* raised from the stock 25. Tunables are marked [TUNE].
+* Time = frames * 20 ms (frame rate set by the stock FR bytes) + fixed costs.
+*   The fixed part was measured on hardware as ~370 ms per 0x22=0xC7 sequence
+*   (that command powers the analog part up and down around every pass). With
+*   EPD_4GRAY_KEEP_POWER the analog part stays on between passes and updates.
+*
+* Hardware history: with T_ROW3 = 25 (stock) black was under-driven (ghosts
+* that vanish after a full refresh), hence 45. Tunables are marked [TUNE].
 ******************************************************************************/
 #include "EPD_2in7_V2_4gray_partial.h"
 #include "Debug.h"
@@ -32,48 +41,56 @@
 /* Declared (non-static) in EPD_2in7_V2.c */
 extern UBYTE LUT_DATA_4Gray[159];
 
-/* [TUNE] RAM fill for LUT row 0 = "keep" (both planes).
- * 0x00 : row 0 <-> pixel code (0x24=0, 0x26=0)  (SSD1680 convention, expected)
- * 0xFF : use if the result looks inverted / the rectangle comes out wrong     */
-#define EPD_KEEP_FILL   0x00
-
-/* [TUNE] frames. Every value can be overridden with -D<NAME>=<n> at build time.
- * Row 3 (black) / row 2 / row 1 as in the stock LUT; they are the VSH pulse
- * lengths that follow the erase, i.e. the cumulative "distance" from white.
- * T_ROW3 must be long enough to bring a pixel from the erased state to full
- * black. Too short -> black looks gray and leaves a light ghost where a black
- * pixel was restored (this is what 25 produced on the first hardware test). */
+/* [TUNE] frames. Every value can be overridden with -D<NAME>=<n> at build time. */
 #ifndef T_ROW1
-#define T_ROW1   3
+#define T_ROW1   3    /* light gray: VSH after the erase, frames */
 #endif
 #ifndef T_ROW2
-#define T_ROW2   8
+#define T_ROW2   8    /* dark gray: cumulative VSH after the erase, frames (>= T_ROW1) */
 #endif
 #ifndef T_ROW3
-#define T_ROW3   45
+#define T_ROW3   45   /* black: VSH that saturates a pixel to black from any state */
 #endif
 #ifndef T_ERASE
-#define T_ERASE  40   /* VSL pulse that must saturate from any gray */
-#endif
-#ifndef T_ERASE_PRE
-#define T_ERASE_PRE 0 /* optional VSH pre-pulse before the erase, frames */
-#endif
-#ifndef T_ERASE_REP
-#define T_ERASE_REP 1 /* how many times (VSH pre + VSL erase) is repeated, 1..16 */
+#define T_ERASE  40   /* VSL that saturates a pixel to white from any state */
 #endif
 
-/* [TUNE] Full refresh (EPD_2IN7_V2_4Gray_Full): the stock 4-gray waveform is 262 frames
- * (~23 ms each here, ~6 s). 168 of them are the "shake" group 1 (VSH 20 / VSL 20 / ...
- * repeated RP+1 = 4 times). The shake is DC-balanced per repetition, so it can be shortened
- * without changing the gray levels set by groups 0 and 2:
- *   RP=3 stock (262 frames), RP=2 (220), RP=1 (178), RP=0 (136).
- * Less shake = faster, but weaker ghost removal. */
+/* [TUNE] 1 = leave the analog part powered after an update (0x22=0xC4) instead of
+ * powering it up and down around every pass (0x22=0xC7, ~330 ms each). Call
+ * EPD_2IN7_V2_4Gray_PowerOff() when the display goes idle. */
+#ifndef EPD_4GRAY_KEEP_POWER
+#define EPD_4GRAY_KEEP_POWER 1
+#endif
+
+/* [TUNE] full refresh: shake group 1 of the stock LUT is TPA=TPC=20 frames (+1+1),
+ * repeated RP+1 = 4 times. RP=3/TP=20 is the stock 262-frame waveform;
+ * RP=1 -> 178 frames (no ghosts on hardware), RP=0 -> 136 frames. */
 #ifndef EPD_FULL_SHAKE_RP
-#define EPD_FULL_SHAKE_RP  1
+#define EPD_FULL_SHAKE_RP  0
+#endif
+#ifndef EPD_FULL_SHAKE_TP
+#define EPD_FULL_SHAKE_TP  20
+#endif
+
+/* [TUNE] pause after BUSY falls, ms (the stock library uses 20) */
+#ifndef EPD_4GRAY_BUSY_SETTLE_MS
+#define EPD_4GRAY_BUSY_SETTLE_MS 2
+#endif
+
+/* [TUNE] BUSY timeout. A stuck panel must not hang the MCU. */
+#ifndef EPD_4GRAY_BUSY_TIMEOUT_MS
+#define EPD_4GRAY_BUSY_TIMEOUT_MS  10000U
 #endif
 
 #define BYTES_PER_ROW   (EPD_2IN7_V2_WIDTH / 8)    /* 22 plane bytes / 44 image bytes */
 #define IMG_STRIDE      (EPD_2IN7_V2_WIDTH / 4)
+
+#ifdef EPD_4GRAY_PROFILE
+EPD_4Gray_Profile epd_4gray_prof;
+#define PROF(f)  do { epd_4gray_prof.f = (uint16_t)(HAL_GetTick() - prof_t); prof_t = HAL_GetTick(); } while (0)
+#else
+#define PROF(f)  do { } while (0)
+#endif
 
 /* --------------------------- low level --------------------------------- */
 static void g_cmd(UBYTE reg)
@@ -103,31 +120,28 @@ static void g_burst_end(void)
     DEV_Digital_Write(EPD_CS_PIN, 1);
 }
 
-/* [TUNE] BUSY timeout. One pass lasts ~1 s; a stuck panel must not hang the MCU. */
-#define EPD_4GRAY_BUSY_TIMEOUT_MS  10000U
-
-static UBYTE s_timeout;
-
 /* returns 0 = ready, -1 = timeout */
 static int g_busy(void)
 {
     uint32_t t0 = HAL_GetTick();
     while (DEV_Digital_Read(EPD_BUSY_PIN) != 0) {       /* BUSY = 1 -> busy */
-        if ((uint32_t)(HAL_GetTick() - t0) >= EPD_4GRAY_BUSY_TIMEOUT_MS) {
-            s_timeout = 1;
+        if ((uint32_t)(HAL_GetTick() - t0) >= EPD_4GRAY_BUSY_TIMEOUT_MS)
             return -1;
-        }
         DEV_Delay_ms(1);
     }
-    DEV_Delay_ms(20);
+#if EPD_4GRAY_BUSY_SETTLE_MS > 0
+    DEV_Delay_ms(EPD_4GRAY_BUSY_SETTLE_MS);
+#endif
     return 0;
 }
 
-/* same as EPD_2IN7_V2_TurnOnDisplay_4GRAY: LUT from register, mode 1 */
-static int g_turn_on(void)
+/* Display update, LUT from register, mode 1.
+ * 0xC7 = clock+analog on, display, analog+clock off   (stock, powers down)
+ * 0xC4 = clock+analog on, display, stay powered       */
+static int g_turn_on(UBYTE ctrl)
 {
     g_cmd(0x22);
-    g_data(0xC7);
+    g_data(ctrl);
     g_cmd(0x20);
     return g_busy();
 }
@@ -136,6 +150,10 @@ static int g_turn_on(void)
 /* Layout: [0..59] VS 5 rows x 12 groups (byte = phases A,B,C,D, 2 bit each,
  * 01=VSH1 10=VSL), [60..143] 12 groups x {TPA,TPB,SRAB,TPC,TPD,SRCD,RP},
  * [144..152] FR + XON (copied from the stock LUT). */
+#define VSH_A   0x40
+#define VSH_AB  0x50
+#define VSL_A   0x80
+
 static void lut_base(UBYTE *l)
 {
     memset(l, 0, 153);
@@ -148,53 +166,101 @@ static void lut_group(UBYTE *l, int g, UBYTE tpa, UBYTE tpb, UBYTE tpc, UBYTE tp
     p[0] = tpa; p[1] = tpb; p[2] = 0; p[3] = tpc; p[4] = tpd; p[5] = 0; p[6] = rp;
 }
 
-static void lut_build_erase(UBYTE *l)
+/* pass 1: row 3 (black) VSH T_ROW3; rows 1,2 (everything else) VSL T_ERASE.
+ * Both run from frame 0; the shorter one is simply idle afterwards. */
+static void lut_build_p1(UBYTE *l)
 {
+    const int common = T_ERASE < T_ROW3 ? T_ERASE : T_ROW3;
+    const int diff   = T_ERASE < T_ROW3 ? T_ROW3 - T_ERASE : T_ERASE - T_ROW3;
+    int g = 0;
+
     lut_base(l);
-    l[3 * 12 + 0] = 0x60;                 /* row 3: A=VSH (pre), B=VSL */
-    lut_group(l, 0, T_ERASE_PRE, T_ERASE, 0, 0, T_ERASE_REP - 1);
+    if (common > 0) {
+        l[1 * 12 + g] = VSL_A;
+        l[2 * 12 + g] = VSL_A;
+        l[3 * 12 + g] = VSH_A;
+        lut_group(l, g++, (UBYTE)common, 0, 0, 0, 0);
+    }
+    if (diff > 0) {
+        if (T_ERASE > T_ROW3) { l[1 * 12 + g] = VSL_A; l[2 * 12 + g] = VSL_A; }
+        else                  { l[3 * 12 + g] = VSH_A; }
+        lut_group(l, g++, (UBYTE)diff, 0, 0, 0, 0);
+    }
 }
 
-static void lut_build_draw(UBYTE *l)
+/* pass 2: row 1 VSH T_ROW1 frames, row 2 VSH T_ROW2 frames; rows 0 and 3 idle */
+static void lut_build_p2(UBYTE *l)
 {
     lut_base(l);
-    l[1 * 12 + 0] = 0x40;                 /* row 1: A=VSH             */
-    l[2 * 12 + 0] = 0x50;                 /* row 2: A,B=VSH           */
-    l[3 * 12 + 0] = 0x54;                 /* row 3: A,B,C=VSH         */
-    lut_group(l, 0, T_ROW1, T_ROW2 - T_ROW1, T_ROW3 - T_ROW2, 0, 0);
+    l[1 * 12 + 0] = VSH_A;
+    l[2 * 12 + 0] = VSH_AB;
+    lut_group(l, 0, T_ROW1, T_ROW2 - T_ROW1, 0, 0, 0);
+}
+
+/* full refresh: stock LUT with an adjustable shake group (group 1) */
+static void lut_build_full(UBYTE *l)
+{
+    memcpy(l, LUT_DATA_4Gray, 153);
+    l[60 + 1 * 7 + 0] = EPD_FULL_SHAKE_TP;      /* TPA */
+    l[60 + 1 * 7 + 3] = EPD_FULL_SHAKE_TP;      /* TPC */
+    l[60 + 1 * 7 + 6] = EPD_FULL_SHAKE_RP;      /* RP  */
 }
 
 /* ---------------------------- RAM planes -------------------------------- */
-/* Mask: 1 bit per pixel, MSB first, 22 bytes per row (5808 bytes). 1 = update. */
+/* Image pixel = 2 bits (11 white, 10 light, 01 dark, 00 black), 4 px per byte, MSB
+ * first. A plane byte holds 8 pixels = 2 image bytes. These tables turn the 4 pixels
+ * of one image byte into 4 plane bits (bit 3 = first pixel):
+ *   t24: inverted low pixel bit  (RAM 0x24, as in EPD_2IN7_V2_4GrayDisplay)
+ *   t26: inverted high pixel bit (RAM 0x26)
+ *   tbk: pixel is black   tgr: pixel is light or dark gray                      */
+static UBYTE t24[256], t26[256], tbk[256], tgr[256];
+static UBYTE tables_ready;
 
-/* bitsel: 0 -> plane 0x24 (inverted low pixel bit), 1 -> plane 0x26 (inverted
- * high pixel bit). Identical to the conversion in EPD_2IN7_V2_4GrayDisplay.
- * erase_pass: masked pixels get the "not keep" code, others the "keep" code. */
-static void send_plane(UBYTE ram_cmd, const UBYTE *img, UBYTE bitsel,
-                       const UBYTE *mask, UBYTE erase_pass)
+static void tables_init(void)
+{
+    for (int b = 0; b < 256; b++) {
+        UBYTE a = 0, c = 0, k = 0, g = 0;
+        for (int j = 0; j < 4; j++) {
+            UBYTE px = (UBYTE)((b >> (6 - 2 * j)) & 3);
+            UBYTE bit = (UBYTE)(1u << (3 - j));
+            if (!(px & 1)) a |= bit;
+            if (!(px & 2)) c |= bit;
+            if (px == 0)   k |= bit;
+            if (px == 1 || px == 2) g |= bit;
+        }
+        t24[b] = a; t26[b] = c; tbk[b] = k; tgr[b] = g;
+    }
+    tables_ready = 1;
+}
+
+static inline UBYTE pk(const UBYTE *t, const UBYTE *p)
+{
+    return (UBYTE)((t[p[0]] << 4) | t[p[1]]);
+}
+
+typedef enum { PASS_FULL, PASS_1, PASS_2 } pass_t;
+
+/* plane: 0 -> RAM 0x24, 1 -> RAM 0x26. Mask 1 = pixel is updated (NULL = all).
+ * RAM pair (0x24,0x26) per pixel: (0,0) keep; PASS_1: black (1,1), other masked (1,0);
+ * PASS_2: light/dark gray = the pair of the stock encoding, everything else (0,0). */
+static void send_plane(UBYTE plane, pass_t pass, const UBYTE *img, const UBYTE *mask)
 {
     UBYTE row[BYTES_PER_ROW];
+    const UBYTE *t = plane ? t26 : t24;
 
-    g_cmd(ram_cmd);
+    g_cmd(plane ? 0x26 : 0x24);
     g_burst_begin();
     for (UWORD y = 0; y < EPD_2IN7_V2_HEIGHT; y++) {
+        const UBYTE *irow = img + (UDOUBLE)y * IMG_STRIDE;
+        const UBYTE *mrow = mask ? mask + (UDOUBLE)y * BYTES_PER_ROW : NULL;
         for (UWORD xb = 0; xb < BYTES_PER_ROW; xb++) {
-            UBYTE m = mask ? mask[(UDOUBLE)y * BYTES_PER_ROW + xb] : 0xFF;   /* NULL = all */
+            const UBYTE *p = irow + xb * 2;
+            UBYTE m = mrow ? mrow[xb] : 0xFF;
             UBYTE out;
-            if (m == 0) {
-                out = EPD_KEEP_FILL;                      /* nothing to do here */
-            } else if (erase_pass) {
-                out = (UBYTE)(EPD_KEEP_FILL ^ m);         /* masked: ~keep      */
-            } else {
-                const UBYTE *p = img + (UDOUBLE)y * IMG_STRIDE + xb * 2;
-                UBYTE g = 0;
-                for (UBYTE k = 0; k < 8; k++) {
-                    UBYTE px  = (UBYTE)((p[k >> 2] >> (6 - 2 * (k & 3))) & 3);
-                    UBYTE bit = (UBYTE)(((px >> bitsel) & 1) ^ 1);
-                    g = (UBYTE)((g << 1) | bit);
-                }
-                out = (UBYTE)((g & m) | (EPD_KEEP_FILL & (UBYTE)~m));
-            }
+            if (pass == PASS_FULL)  out = pk(t, p);
+            else if (m == 0)        out = 0;                         /* keep */
+            else if (pass == PASS_1) out = plane ? (UBYTE)(m & pk(tbk, p)) : m;
+            else                    out = (UBYTE)(pk(t, p) & m & pk(tgr, p));
             row[xb] = out;
         }
         DEV_SPI_Write_nByte(row, BYTES_PER_ROW);
@@ -202,9 +268,10 @@ static void send_plane(UBYTE ram_cmd, const UBYTE *img, UBYTE bitsel,
     g_burst_end();
 }
 
-static void send_setup_and_lut(const UBYTE *lut153)
+/* Registers common to all passes. border: 0x80 = no border drive (partial), 0x00 = stock. */
+static void send_setup(UBYTE border)
 {
-    g_cmd(0x3C); g_data(0x80);                    /* border: no drive (as in Display_Partial) */
+    g_cmd(0x3C); g_data(border);
 
     g_cmd(0x2C); g_data(LUT_DATA_4Gray[158]);     /* same order as Init_4GRAY */
     g_cmd(0x3F); g_data(LUT_DATA_4Gray[153]);
@@ -213,36 +280,56 @@ static void send_setup_and_lut(const UBYTE *lut153)
                  g_data(LUT_DATA_4Gray[156]);
                  g_data(LUT_DATA_4Gray[157]);
 
-    g_cmd(0x32);
-    for (UWORD i = 0; i < 153; i++) g_data(lut153[i]);
-
     g_cmd(0x11); g_data(0x03);                    /* entry mode */
     g_cmd(0x44); g_data(0x00); g_data(0x15);      /* X: 0..21 bytes */
     g_cmd(0x45); g_data(0x00); g_data(0x00); g_data(0x07); g_data(0x01); /* Y: 0..263 */
+}
+
+/* LUT + RAM cursor to 0,0 (before the planes of every pass) */
+static void send_lut_and_cursor(const UBYTE *lut153)
+{
+    g_cmd(0x32);
+    g_burst_begin();
+    DEV_SPI_Write_nByte((UBYTE *)lut153, 153);
+    g_burst_end();
+
     g_cmd(0x4E); g_data(0x00);
     g_cmd(0x4F); g_data(0x00); g_data(0x00);
 }
 
 /* ------------------------------ API ------------------------------------ */
+#if EPD_4GRAY_KEEP_POWER
+#define CTRL_LAST  0xC4
+#else
+#define CTRL_LAST  0xC7
+#endif
+
 int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask)
 {
     UBYTE lut[153];
+#ifdef EPD_4GRAY_PROFILE
+    uint32_t prof_t = HAL_GetTick();
+#endif
 
-    s_timeout = 0;
+    if (!tables_ready) tables_init();
 
-    /* pass 1: masked pixels -> VSL extreme */
-    lut_build_erase(lut);
-    send_setup_and_lut(lut);
-    send_plane(0x24, Image, 0, Mask, 1);
-    send_plane(0x26, Image, 1, Mask, 1);
-    if (g_turn_on() != 0) return -1;
+    lut_build_p1(lut);
+    send_setup(0x80);
+    send_lut_and_cursor(lut);
+    PROF(setup1);
+    send_plane(0, PASS_1, Image, Mask);
+    send_plane(1, PASS_1, Image, Mask);
+    PROF(spi1);
+    if (g_turn_on(CTRL_LAST) != 0) return -1;
+    PROF(wait1);
 
-    /* pass 2: draw the grays of Image into the masked pixels */
-    lut_build_draw(lut);
-    send_setup_and_lut(lut);
-    send_plane(0x24, Image, 0, Mask, 0);
-    send_plane(0x26, Image, 1, Mask, 0);
-    if (g_turn_on() != 0) return -1;
+    lut_build_p2(lut);
+    send_lut_and_cursor(lut);
+    send_plane(0, PASS_2, Image, Mask);
+    send_plane(1, PASS_2, Image, Mask);
+    PROF(spi2);
+    if (g_turn_on(CTRL_LAST) != 0) return -1;
+    PROF(wait2);
 
     return 0;
 }
@@ -250,22 +337,31 @@ int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask)
 int EPD_2IN7_V2_4Gray_Full(const UBYTE *Image)
 {
     UBYTE lut[153];
+#ifdef EPD_4GRAY_PROFILE
+    uint32_t prof_t = HAL_GetTick();
+#endif
 
-    s_timeout = 0;
+    if (!tables_ready) tables_init();
 
-    EPD_2IN7_V2_Init_4GRAY();               /* stock: reset, registers, border 0, LUT, cursor 0 */
+    /* No hardware reset: the controller was initialised by EPD_2IN7_V2_Init_4GRAY(). */
+    lut_build_full(lut);
+    send_setup(0x00);
+    send_lut_and_cursor(lut);
+    PROF(setup1);
+    send_plane(0, PASS_FULL, Image, NULL);
+    send_plane(1, PASS_FULL, Image, NULL);
+    PROF(spi1);
+    int rc = g_turn_on(CTRL_LAST);
+    PROF(wait1);
+    return rc;
+}
 
-    /* same LUT as stock, but with a shorter shake group 1 */
-    memcpy(lut, LUT_DATA_4Gray, 153);
-    lut[60 + 1 * 7 + 6] = EPD_FULL_SHAKE_RP;
-    g_cmd(0x32);
-    g_burst_begin();
-    DEV_SPI_Write_nByte(lut, 153);
-    g_burst_end();
-
-    send_plane(0x24, Image, 0, NULL, 0);    /* NULL mask = stock conversion of every pixel */
-    send_plane(0x26, Image, 1, NULL, 0);
-    return g_turn_on();
+int EPD_2IN7_V2_4Gray_PowerOff(void)
+{
+    g_cmd(0x22);
+    g_data(0x83);                                 /* clock on, analog off, clock off */
+    g_cmd(0x20);
+    return g_busy();
 }
 
 int EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,

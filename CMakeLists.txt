@@ -56,6 +56,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${WS_EPAPER_LIB}/EPD_2in7_V2.c
 )
 
+# Драйвер частичного обновления считает биты RAM для всей панели - в Debug (-O0) это
+# сотни миллисекунд на обновление, поэтому оптимизируем его всегда.
+set_source_files_properties(Core/Src/EPD_2in7_V2_4gray_partial.c PROPERTIES COMPILE_OPTIONS "-O2")
+
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
@@ -66,6 +70,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+    EPD_4GRAY_PROFILE   # разбивка времени драйвера по фазам (печатается при EINK_PROFILE=1)
+    EINK_PROFILE=1
 )
 
 # Remove wrong libob.a library dependency when using cpp files

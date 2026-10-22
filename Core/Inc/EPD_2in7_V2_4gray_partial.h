@@ -24,14 +24,33 @@
 #define EPD_4GRAY_MASK_SET(m, x, y) \
     ((m)[(UDOUBLE)(y) * (EPD_2IN7_V2_WIDTH / 8) + ((x) >> 3)] |= (UBYTE)(0x80 >> ((x) & 7)))
 
-/* Pixel-exact update: only masked pixels are redrawn.
- * Return: 0 = ok, -1 = BUSY timeout (10 s). Blocks ~1-2 s (two waveform passes). */
-/* Full 4-gray refresh of the whole panel with a shortened shake group (see
- * EPD_FULL_SHAKE_RP in the .c file). Does its own Init_4GRAY. Image = stock Waveshare
- * 2 bpp buffer, 11616 bytes. Return: 0 = ok, -1 = BUSY timeout. */
+/* Pixel-exact update: only masked pixels are redrawn. Two waveform passes,
+ * 53 frames (~1.1 s) with the default timings plus fixed costs.
+ * Return: 0 = ok, -1 = BUSY timeout (10 s). */
+int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask);
+
+/* Full 4-gray refresh of the whole panel (flashes) with an adjustable shake group
+ * (EPD_FULL_SHAKE_RP / EPD_FULL_SHAKE_TP in the .c file). No hardware reset: needs a
+ * prior EPD_2IN7_V2_Init_4GRAY(). Image = stock Waveshare 2 bpp buffer, 11616 bytes.
+ * Return: 0 = ok, -1 = BUSY timeout. */
 int EPD_2IN7_V2_4Gray_Full(const UBYTE *Image);
 
-int EPD_2IN7_V2_4Gray_PartialMask(const UBYTE *Image, const UBYTE *Mask);
+/* With EPD_4GRAY_KEEP_POWER (default 1) the panel's analog part stays powered after an
+ * update; call this when the display goes idle (and before sleeping / cutting power).
+ * Return: 0 = ok, -1 = BUSY timeout. */
+int EPD_2IN7_V2_4Gray_PowerOff(void);
+
+#ifdef EPD_4GRAY_PROFILE
+/* Phase durations of the last update, ms. Full refresh fills setup/spi/wait1 only. */
+typedef struct {
+    uint16_t setup1;   /* registers + LUT of pass 1 */
+    uint16_t spi1;     /* RAM planes of pass 1 (incl. pixel conversion) */
+    uint16_t wait1;    /* 0x20 -> BUSY low: pass 1 waveform + power sequencing */
+    uint16_t spi2;     /* LUT + RAM planes of pass 2 */
+    uint16_t wait2;    /* pass 2 waveform + power sequencing */
+} EPD_4Gray_Profile;
+extern EPD_4Gray_Profile epd_4gray_prof;
+#endif
 
 /* Convenience: rectangle, coordinates INCLUSIVE (builds a mask internally). */
 int EPD_2IN7_V2_4Gray_Partial(const UBYTE *Image,
