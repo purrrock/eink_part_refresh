@@ -1,0 +1,22 @@
+Измерено на железе: Waveshare 2.7" V2 HAT + STM32F411CEU6 (HSI 16 MHz, SPI1 8 MHz), STM32 HAL, сборка Debug.
+Конфигурация по умолчанию: EPD4G_T_BLACK=45, T_WHITE=40, T_DARK=8, T_LIGHT=3, KEEP_POWER=1, FULL_SHAKE_RP=0,
+полное обновление каждое 8-е. EPD4G_PROFILE=ON, EINK_PROFILE=ON.
+
+[UPDATE] FULL refresh (every 8-th update)
+[UPDATE] FULL complete in 2873 ms
+[FRAME] triangle (152,59)->(148,56)
+[UPDATE] #1 rect X=106..129 Y=138..162, pixels in mask=108, mode=changed-only
+[UPDATE] complete in 1431 ms
+[PROF] setup1=2 spi1=63 wait1=1013 spi2=63 wait2=290 ms
+[FRAME] triangle (148,56)->(144,53)
+[UPDATE] #2 rect X=109..132 Y=134..158, pixels in mask=104, mode=changed-only
+[UPDATE] complete in 1431 ms
+[PROF] setup1=2 spi1=63 wait1=1013 spi2=63 wait2=290 ms
+[FRAME] triangle (144,53)->(140,50)
+[UPDATE] #3 rect X=112..135 Y=130..154, pixels in mask=102, mode=changed-only
+[UPDATE] complete in 1431 ms
+[PROF] setup1=2 spi1=63 wait1=1013 spi2=63 wait2=290 ms
+[FRAME] triangle (140,50)->(136,47)
+[UPDATE] #4 rect X=115..138 Y=126..150, pixels in mask=88, mode=changed-only
+[UPDATE] complete in 1429 ms
+[PROF] setup1=2 spi1=63 wait1=1011 spi2=63 wait2=290 ms

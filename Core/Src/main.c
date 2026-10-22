@@ -26,6 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "eink_demo.h"
+#ifndef EINK_DIAG
+#define EINK_DIAG 0     /* 1 = журнал в USART2 (printf), см. CMakeLists.txt */
+#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,14 +95,18 @@ int main(void)
   MX_SPI1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+#if EINK_DIAG
   printf("\r\n=== eink_part_refresh boot ===\r\n");
   printf("[BOOT] SystemCoreClock=%lu Hz, HAL tick=%lu ms\r\n",
          (unsigned long)SystemCoreClock, (unsigned long)HAL_GetTick());
   printf("[BOOT] USART2=115200 8N1, SPI1 display interface initialized\r\n");
   printf("[BOOT] EINK_BUSY PB2 level before panel init: %u\r\n",
          (unsigned)HAL_GPIO_ReadPin(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin));
+#endif
   if (eink_demo_init() != 0) {
+#if EINK_DIAG
     printf("[FATAL] eink_demo_init failed; animation stopped\r\n");
+#endif
     while (1) { HAL_Delay(1000); }
   }
   /* USER CODE END 2 */
@@ -112,7 +119,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
       if (eink_demo_step() != 0) {
+#if EINK_DIAG
         printf("[FATAL] eink_demo_step failed; animation stopped\r\n");
+#endif
         while (1) { HAL_Delay(1000); }
       }
       // HAL_Delay(300); // задержка между кадрами анимации если движение получится слишком быстрым
@@ -162,6 +171,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+#if EINK_DIAG
 /* printf() -> _write() in syscalls.c -> __io_putchar() -> USART2. */
 int __io_putchar(int ch)
 {
@@ -178,7 +188,7 @@ int __io_putchar(int ch)
   }
   return ch;
 }
-
+#endif /* EINK_DIAG */
 /* USER CODE END 4 */
 
 /**

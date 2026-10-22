@@ -1,56 +1,58 @@
 /*
- * eink_demo.c — тест частичного обновления Waveshare 2.7" V2 в режиме 4 gray
- * БЕЗ мигания всего экрана.
+ * eink_demo.c — демонстрация библиотеки epd4g (epd4g/): частичное обновление
+ * Waveshare 2.7" V2 в режиме 4 gray без мигания всего экрана.
  *
  * Что делает:
- *   1. EPD_2IN7_V2_Init_4GRAY() + EPD_2IN7_V2_4GrayDisplay(): один раз рисует фон
- *      (квадраты 22x22 px, 4 полутона) штатным полным обновлением Waveshare.
- *   2. Каждый шаг двигает чёрный треугольник (10 px) с белой обводкой, строит маску
- *      ТОЛЬКО из пикселей, которые реально изменились, и вызывает
- *      EPD_2IN7_V2_4Gray_PartialMask() (Core/Src/EPD_2in7_V2_4gray_partial.c):
- *      два прохода с собственным LUT, у пикселей вне маски нулевое напряжение.
+ *   1. epd4g_init() + epd4g_full(EPD4G_FULL_DEEP): один раз рисует фон (квадраты 22x22 px,
+ *      4 полутона) штатной 262-кадровой волной - самая чистая картинка.
+ *   2. Каждый шаг двигает чёрный треугольник (10 px) с белой обводкой и вызывает
+ *      epd4g_partial_diff(): перерисовываются только пиксели, которые изменились.
  *   3. Каждое EINK_FULL_REFRESH_EVERY-е обновление (по умолчанию 8-е) - полное
- *      обновление всего экрана (Init_4GRAY + 4GrayDisplay), чтобы сбросить
- *      накопленные остаточные следы и дрейф серых. Экран при этом мигает.
+ *      обновление (epd4g_full(EPD4G_FULL_FAST)), чтобы сбросить накопленные следы.
  *
- * Буфер кадра - в штатном формате Waveshare для 4 gray: 2 бита на пиксель,
- * 4 пикселя в байте, старший пиксель в старших битах, 44 байта на строку,
- * 11616 байт. Коды: 11 = белый, 10 = светло-серый, 01 = тёмно-серый, 00 = чёрный.
+ * Это пример использования; библиотека от этого файла не зависит.
  *
- * Экран логически альбомный 264x176, физически панель портретная 176x264.
+ * Настройки (-D... в CMakeLists.txt):
+ *   EINK_DIAG=1              печать журнала в UART (printf), по умолчанию 0
+ *   EINK_PROFILE=1           + разбивка времени по фазам (нужен EPD4G_PROFILE), только при EINK_DIAG
+ *   EINK_ROT                 ориентация, EPD4G_ROT_90 (альбомная) по умолчанию
+ *   EINK_FULL_REFRESH_EVERY  период полного обновления, 0 - никогда
+ *   EINK_STEP_X / EINK_STEP_Y  шаг треугольника за кадр, px
  */
 
 #include "eink_demo.h"
-#include "DEV_Config.h"
-#include "EPD_2in7_V2.h"
-#include "EPD_2in7_V2_4gray_partial.h"
+#include "epd4g.h"
+#include "epd4g_fb.h"
+#include "main.h"           /* HAL_GetTick() */
 #include <string.h>
+
+#ifndef EINK_DIAG
+#define EINK_DIAG           0
+#endif
+#if EINK_DIAG
 #include <stdio.h>
-
-/* ------------------------- настройки эксперимента ------------------------- */
-
-/* Поворот логического экрана на 180°, если картинка перевёрнута */
-#ifndef EINK_ROTATE_180
-#define EINK_ROTATE_180     0
+#define DIAG(...)           printf(__VA_ARGS__)
+#else
+#define DIAG(...)           ((void)0)
 #endif
 
-/* 0 - в маску попадают только изменившиеся пиксели (меньше всего трогаем экран),
- * 1 - вся прямоугольная область вокруг старого и нового положения (для сравнения;
- *     если на границе треугольника остаются "шлейфы", попробуйте 1) */
-#ifndef EINK_MASK_FULL_RECT
-#define EINK_MASK_FULL_RECT 0
+#ifndef EINK_PROFILE
+#define EINK_PROFILE        0
+#endif
+
+/* Ориентация логического экрана. Старый переключатель EINK_ROTATE_180=1 тоже работает. */
+#ifndef EINK_ROT
+#if defined(EINK_ROTATE_180) && EINK_ROTATE_180
+#define EINK_ROT            EPD4G_ROT_270
+#else
+#define EINK_ROT            EPD4G_ROT_90
+#endif
 #endif
 
 /* Каждое N-е обновление - полное (с миганием). 0 - никогда не делать полное.
  * Обновления считаются после стартового полного: 1..N-1 частичные, N-е полное, ... */
 #ifndef EINK_FULL_REFRESH_EVERY
 #define EINK_FULL_REFRESH_EVERY 8
-#endif
-
-/* 1 - после каждого обновления печатать разбивку времени по фазам драйвера
- * (нужно собрать драйвер с -DEPD_4GRAY_PROFILE, см. CMakeLists.txt) */
-#ifndef EINK_PROFILE
-#define EINK_PROFILE        0
 #endif
 
 /* Шаг треугольника за одно обновление (px). Скорость ограничена временем update. */
@@ -61,70 +63,31 @@
 #define EINK_STEP_Y         3
 #endif
 
-/* Уровни демо -> 2-битный код пикселя Waveshare.
- * 0 = чёрный, 3 = белый. Если два серых на экране идут не в том порядке
- * (светлый/тёмный) - поменяйте местами значения 1 и 2. */
-static const uint8_t LVL_CODE[4] = {0, 1, 2, 3};
-
-/* ------------------------------- геометрия -------------------------------- */
-
-#define NAT_W       EPD_2IN7_V2_WIDTH       /* 176, ширина панели (портрет) */
-#define NAT_H       EPD_2IN7_V2_HEIGHT      /* 264 */
-#define IMG_STRIDE  (NAT_W / 4)             /* 44 байта на строку */
-#define IMG_SZ      (IMG_STRIDE * NAT_H)    /* 11616 */
-
-#define LW          264                     /* логическая ширина (альбом) */
-#define LH          176
 #define CELL        22                      /* 264/22 = 12, 176/22 = 8 */
 #define TRI_R       10                      /* запас вокруг центра треугольника */
 
-typedef struct { int x0, x1, y0, y1; } nrect_t;   /* в пикселях панели, включительно */
-
-static uint8_t bg[IMG_SZ];                  /* фон */
-static uint8_t cur[IMG_SZ];                 /* текущий кадр (фон + треугольник) */
-static uint8_t prev[IMG_SZ];                /* кадр, который сейчас на панели */
-static uint8_t mask[EPD_4GRAY_MASK_BYTES];  /* 1 бит/пиксель, 22 байта на строку */
+static uint8_t bg[EPD4G_FB_BYTES];          /* фон */
+static uint8_t cur[EPD4G_FB_BYTES];         /* текущий кадр (фон + треугольник) */
+static uint8_t prev[EPD4G_FB_BYTES];        /* кадр, который сейчас на панели */
 
 static int s_x = 60, s_y = 50, s_dx = EINK_STEP_X, s_dy = EINK_STEP_Y;
 static uint32_t s_last_ms;
 static uint32_t s_upd_cnt;                  /* обновлений с последнего полного */
 
-/* ------------------------------ пиксели ----------------------------------- */
+/* ------------------------------- рисование -------------------------------- */
 
-static void l2n(int lx, int ly, int *nx, int *ny)
+static void put_logical(uint8_t *fb, int lx, int ly, uint8_t level)
 {
-#if EINK_ROTATE_180
-    *nx = ly;
-    *ny = LW - 1 - lx;
-#else
-    *nx = LH - 1 - ly;
-    *ny = lx;
-#endif
+    epd4g_fb_set_rot(fb, EINK_ROT, lx, ly, level);
 }
-
-static uint8_t get_native(const uint8_t *img, int nx, int ny)
-{
-    return (uint8_t)((img[(uint32_t)ny * IMG_STRIDE + (nx >> 2)] >> (6 - 2 * (nx & 3))) & 3);
-}
-
-static void put_logical(uint8_t *img, int lx, int ly, uint8_t lvl)
-{
-    if (lx < 0 || ly < 0 || lx >= LW || ly >= LH) return;
-    int nx, ny;
-    l2n(lx, ly, &nx, &ny);
-    uint32_t idx = (uint32_t)ny * IMG_STRIDE + (nx >> 2);
-    int sh = 6 - 2 * (nx & 3);
-    img[idx] = (uint8_t)((img[idx] & ~(3 << sh)) | (LVL_CODE[lvl] << sh));
-}
-
-/* -------------------------------- рисование ------------------------------- */
 
 static void render_background(void)
 {
-    for (int ly = 0; ly < LH; ly++) {
-        for (int lx = 0; lx < LW; lx++) {
-            uint8_t lvl = (uint8_t)(((lx / CELL) + (ly / CELL)) & 3);
-            put_logical(bg, lx, ly, lvl);
+    const int lw = epd4g_logical_width(EINK_ROT), lh = epd4g_logical_height(EINK_ROT);
+    for (int ly = 0; ly < lh; ly++) {
+        for (int lx = 0; lx < lw; lx++) {
+            /* уровни 0..3 = EPD4G_BLACK, EPD4G_DARK, EPD4G_LIGHT, EPD4G_WHITE */
+            put_logical(bg, lx, ly, (uint8_t)(((lx / CELL) + (ly / CELL)) & 3));
         }
     }
 }
@@ -150,75 +113,47 @@ static void draw_triangle(int cx, int cy)
             float d3 = edge_d( 5,  0, -5, -5, L_CA, px, py);
             float d  = d1 < d2 ? d1 : d2;
             if (d3 < d) d = d3;
-            if (d >= 0.0f)           put_logical(cur, cx + dx, cy + dy, 0);  /* чёрный */
-            else if (d >= -OUTLINE)  put_logical(cur, cx + dx, cy + dy, 3);  /* белая обводка */
+            if (d >= 0.0f)           put_logical(cur, cx + dx, cy + dy, EPD4G_BLACK);
+            else if (d >= -OUTLINE)  put_logical(cur, cx + dx, cy + dy, EPD4G_WHITE);   /* обводка */
         }
     }
 }
 
 /* ------------------------- прямоугольники обновления ---------------------- */
 
-static int imin(int a, int b) { return a < b ? a : b; }
-static int imax(int a, int b) { return a > b ? a : b; }
-
-static nrect_t rect_logical(int lx0, int ly0, int lx1, int ly1)
+static epd4g_rect_t rect_union(epd4g_rect_t a, epd4g_rect_t b)
 {
-    lx0 = imax(lx0, 0); ly0 = imax(ly0, 0);
-    lx1 = imin(lx1, LW - 1); ly1 = imin(ly1, LH - 1);
-    int ax, ay, bx, by;
-    l2n(lx0, ly0, &ax, &ay);
-    l2n(lx1, ly1, &bx, &by);
-    nrect_t r;
-    r.x0 = imin(ax, bx); r.x1 = imax(ax, bx);
-    r.y0 = imin(ay, by); r.y1 = imax(ay, by);
+    epd4g_rect_t r;
+    r.x0 = a.x0 < b.x0 ? a.x0 : b.x0;  r.x1 = a.x1 > b.x1 ? a.x1 : b.x1;
+    r.y0 = a.y0 < b.y0 ? a.y0 : b.y0;  r.y1 = a.y1 > b.y1 ? a.y1 : b.y1;
     return r;
 }
 
-static nrect_t rect_union(nrect_t a, nrect_t b)
+static epd4g_rect_t rect_around(int cx, int cy)
 {
-    nrect_t r;
-    r.x0 = imin(a.x0, b.x0); r.x1 = imax(a.x1, b.x1);
-    r.y0 = imin(a.y0, b.y0); r.y1 = imax(a.y1, b.y1);
+    epd4g_rect_t r = {0, 0, 0, 0};
+    epd4g_map_rect(EINK_ROT, cx - TRI_R, cy - TRI_R, cx + TRI_R, cy + TRI_R, &r);
     return r;
-}
-
-static nrect_t rect_around(int cx, int cy)
-{
-    return rect_logical(cx - TRI_R, cy - TRI_R, cx + TRI_R, cy + TRI_R);
-}
-
-/* Копирует фон в прямоугольник (с округлением до байта по X: пиксели вне rect
- * и так равны фону, потому что треугольник целиком внутри rect). */
-static void restore_from_bg(const nrect_t *r)
-{
-    int xb0 = r->x0 >> 2, xb1 = r->x1 >> 2;
-    for (int y = r->y0; y <= r->y1; y++) {
-        uint32_t o = (uint32_t)y * IMG_STRIDE + (uint32_t)xb0;
-        memcpy(&cur[o], &bg[o], (size_t)(xb1 - xb0 + 1));
-    }
 }
 
 /* ------------------------------ обновление -------------------------------- */
 
-/* Полное обновление всего экрана. EPD_2IN7_V2_4Gray_Full() сама загружает LUT, границу
- * и адресные регистры (аппаратный сброс не нужен); встряска настраивается через
- * EPD_FULL_SHAKE_RP / EPD_FULL_SHAKE_TP. */
 static int full_refresh(void)
 {
+    DIAG("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
     uint32_t t0 = HAL_GetTick();
-    printf("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
-    int rc = EPD_2IN7_V2_4Gray_Full(cur);   /* без аппаратного сброса, LUT с короткой встряской */
+    int rc = epd4g_full(cur, EPD4G_FULL_FAST);
     s_last_ms = HAL_GetTick() - t0;
-    if (rc != 0)
-        printf("[ERROR][UPDATE] FULL: BUSY timeout after %lu ms\r\n", (unsigned long)s_last_ms);
+    if (rc != EPD4G_OK)
+        DIAG("[ERROR][UPDATE] FULL failed rc=%d after %lu ms\r\n", rc, (unsigned long)s_last_ms);
     else
-        printf("[UPDATE] FULL complete in %lu ms\r\n", (unsigned long)s_last_ms);
+        DIAG("[UPDATE] FULL complete in %lu ms\r\n", (unsigned long)s_last_ms);
     return rc;
 }
 
-/* Строит маску по отличиям cur от prev внутри rect и обновляет панель.
+/* Обновляет панель: cur отличается от prev только внутри roi.
  * Каждое EINK_FULL_REFRESH_EVERY-е обновление вместо этого - полное. */
-static int push_diff(const nrect_t *r)
+static int push_update(const epd4g_rect_t *roi)
 {
     uint32_t changed = 0;
 
@@ -226,44 +161,27 @@ static int push_diff(const nrect_t *r)
 #if EINK_FULL_REFRESH_EVERY > 0
     if (s_upd_cnt >= (uint32_t)EINK_FULL_REFRESH_EVERY) {
         s_upd_cnt = 0;
-        return full_refresh();
+        return full_refresh() == EPD4G_OK ? 0 : -1;
     }
 #endif
 
-    memset(mask, 0, sizeof mask);
-    for (int y = r->y0; y <= r->y1; y++) {
-        for (int x = r->x0; x <= r->x1; x++) {
-#if EINK_MASK_FULL_RECT
-            int diff = 1;
-#else
-            int diff = get_native(cur, x, y) != get_native(prev, x, y);
-#endif
-            if (diff) {
-                EPD_4GRAY_MASK_SET(mask, x, y);
-                changed++;
-            }
-        }
-    }
-    printf("[UPDATE] #%lu rect X=%d..%d Y=%d..%d, pixels in mask=%lu, mode=%s\r\n",
-           (unsigned long)s_upd_cnt, r->x0, r->x1, r->y0, r->y1, (unsigned long)changed,
-           EINK_MASK_FULL_RECT ? "full-rect" : "changed-only");
-
-    if (changed == 0) {
-        s_last_ms = 0;
-        return 0;
-    }
-    uint32_t t0 = HAL_GetTick();            /* время только вызова драйвера */
-    int rc = EPD_2IN7_V2_4Gray_PartialMask(cur, mask);
-    s_last_ms = HAL_GetTick() - t0;
-    if (rc != 0) {
-        printf("[ERROR][UPDATE] BUSY timeout after %lu ms\r\n", (unsigned long)s_last_ms);
+    uint32_t t0 = HAL_GetTick();            /* время только вызова библиотеки */
+    int rc = epd4g_partial_diff(prev, cur, roi, &changed);
+    s_last_ms = changed ? HAL_GetTick() - t0 : 0;
+    DIAG("[UPDATE] #%lu rect X=%d..%d Y=%d..%d, pixels in mask=%lu\r\n",
+         (unsigned long)s_upd_cnt, roi->x0, roi->x1, roi->y0, roi->y1, (unsigned long)changed);
+    if (rc != EPD4G_OK) {
+        DIAG("[ERROR][UPDATE] partial failed rc=%d after %lu ms\r\n", rc, (unsigned long)s_last_ms);
         return -1;
     }
-    printf("[UPDATE] complete in %lu ms\r\n", (unsigned long)s_last_ms);
-#if EINK_PROFILE && defined(EPD_4GRAY_PROFILE)
-    printf("[PROF] setup1=%u spi1=%u wait1=%u spi2=%u wait2=%u ms\r\n",
-           epd_4gray_prof.setup1, epd_4gray_prof.spi1, epd_4gray_prof.wait1,
-           epd_4gray_prof.spi2, epd_4gray_prof.wait2);
+    if (changed)
+        DIAG("[UPDATE] complete in %lu ms\r\n", (unsigned long)s_last_ms);
+#if EINK_DIAG && EINK_PROFILE && defined(EPD4G_PROFILE)
+    if (changed) {
+        const epd4g_profile_t *p = epd4g_get_profile();
+        DIAG("[PROF] setup=%u spi1=%u wait1=%u spi2=%u wait2=%u ms\r\n",
+             p->setup, p->spi1, p->wait1, p->spi2, p->wait2);
+    }
 #endif
     return 0;
 }
@@ -272,50 +190,56 @@ static int push_diff(const nrect_t *r)
 
 int eink_demo_init(void)
 {
-    printf("[INIT] DEV_Module_Init()\r\n");
-    DEV_Module_Init();
-    printf("[INIT] EPD_2IN7_V2_Init_4GRAY(); BUSY=%u\r\n",
-           (unsigned)DEV_Digital_Read(EPD_BUSY_PIN));
-    EPD_2IN7_V2_Init_4GRAY();               /* сброс + загрузка 4-gray LUT (Waveshare) */
+    int rc;
 
-    printf("[INIT] rendering %dx%d 4-gray background (%lu bytes)\r\n",
-           LW, LH, (unsigned long)IMG_SZ);
+    DIAG("[INIT] epd4g_init()\r\n");
+    if ((rc = epd4g_init()) != EPD4G_OK) {
+        DIAG("[ERROR][INIT] epd4g_init rc=%d\r\n", rc);
+        return -1;
+    }
+
+    DIAG("[INIT] rendering %dx%d 4-gray background (%lu bytes)\r\n",
+         epd4g_logical_width(EINK_ROT), epd4g_logical_height(EINK_ROT), (unsigned long)EPD4G_FB_BYTES);
     render_background();
-    memcpy(cur, bg, IMG_SZ);
+    memcpy(cur, bg, sizeof cur);
 
-    printf("[INIT] full 4-gray refresh (stock Waveshare)\r\n");
-    EPD_2IN7_V2_4GrayDisplay(cur);          /* стартовое полное обновление */
-    memcpy(prev, cur, IMG_SZ);
+    DIAG("[INIT] full 4-gray refresh (stock 262-frame waveform)\r\n");
+    if ((rc = epd4g_full(cur, EPD4G_FULL_DEEP)) != EPD4G_OK) {
+        DIAG("[ERROR][INIT] epd4g_full rc=%d\r\n", rc);
+        return -1;
+    }
+    memcpy(prev, cur, sizeof prev);
     s_upd_cnt = 0;
 
     /* первый кадр с треугольником - уже частичным обновлением */
-    nrect_t r = rect_around(s_x, s_y);
+    epd4g_rect_t r = rect_around(s_x, s_y);
     draw_triangle(s_x, s_y);
-    if (push_diff(&r) != 0) {
-        printf("[ERROR][INIT] initial triangle update failed\r\n");
+    if (push_update(&r) != 0) {
+        DIAG("[ERROR][INIT] initial triangle update failed\r\n");
         return -1;
     }
-    printf("[INIT] complete; initial triangle=(%d,%d)\r\n", s_x, s_y);
+    DIAG("[INIT] complete; initial triangle=(%d,%d)\r\n", s_x, s_y);
     return 0;
 }
 
 int eink_demo_step(void)
 {
+    const int lw = epd4g_logical_width(EINK_ROT), lh = epd4g_logical_height(EINK_ROT);
     int ox = s_x, oy = s_y;
 
-    memcpy(prev, cur, IMG_SZ);              /* то, что сейчас на панели */
+    memcpy(prev, cur, sizeof prev);         /* то, что сейчас на панели */
 
     s_x += s_dx;
     s_y += s_dy;
-    if (s_x < 14 || s_x > LW - 15) { s_dx = -s_dx; s_x += 2 * s_dx; }
-    if (s_y < 14 || s_y > LH - 15) { s_dy = -s_dy; s_y += 2 * s_dy; }
+    if (s_x < 14 || s_x > lw - 15) { s_dx = -s_dx; s_x += 2 * s_dx; }
+    if (s_y < 14 || s_y > lh - 15) { s_dy = -s_dy; s_y += 2 * s_dy; }
 
-    nrect_t r = rect_union(rect_around(ox, oy), rect_around(s_x, s_y));
-    printf("[FRAME] triangle (%d,%d)->(%d,%d)\r\n", ox, oy, s_x, s_y);
-    restore_from_bg(&r);
+    epd4g_rect_t r = rect_union(rect_around(ox, oy), rect_around(s_x, s_y));
+    DIAG("[FRAME] triangle (%d,%d)->(%d,%d)\r\n", ox, oy, s_x, s_y);
+    epd4g_fb_copy_rect(cur, bg, &r);        /* стереть старый треугольник фоном */
     draw_triangle(s_x, s_y);
-    if (push_diff(&r) != 0) {
-        printf("[ERROR][FRAME] frame update failed; aborting animation\r\n");
+    if (push_update(&r) != 0) {
+        DIAG("[ERROR][FRAME] frame update failed; aborting animation\r\n");
         return -1;
     }
     return 0;

@@ -42,36 +42,38 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
-# Waveshare e-Paper library (git submodule)
-#set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/RaspberryPi_JetsonNano/c/lib/e-Paper)
-set(WS_EPAPER_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/e-Paper/STM32/STM32-F103ZET6/User/e-Paper)
+# ---------------------------------------------------------------------------
+# Библиотека epd4g (папка epd4g/) - частичное и быстрое полное обновление 4 gray.
+# Самодостаточная: Waveshare-библиотека и DEV_Config больше не нужны.
+# ---------------------------------------------------------------------------
+# Опции демо-прошивки (cmake -DEINK_DIAG=OFF ...):
+option(EINK_DIAG    "Печатать журнал демо в USART2 (printf)" ON)
+option(EINK_PROFILE "Печатать время по фазам каждого обновления (нужен EINK_DIAG)" OFF)
 
+set(EPD4G_PROFILE ${EINK_PROFILE})          # передаём опцию библиотеке
+add_subdirectory(epd4g)
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    Core/Src/DEV_Config.c
     Core/Src/eink_demo.c
-    Core/Src/EPD_2in7_V2_4gray_partial.c
-    ${WS_EPAPER_LIB}/EPD_2in7_V2.c
 )
-
-# Драйвер частичного обновления считает биты RAM для всей панели - в Debug (-O0) это
-# сотни миллисекунд на обновление, поэтому оптимизируем его всегда.
-set_source_files_properties(Core/Src/EPD_2in7_V2_4gray_partial.c PROPERTIES COMPILE_OPTIONS "-O2")
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Core/Inc
-    ${WS_EPAPER_LIB}
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
-    EPD_4GRAY_PROFILE   # разбивка времени драйвера по фазам (печатается при EINK_PROFILE=1)
-    EINK_PROFILE=1
+    EINK_DIAG=$<BOOL:${EINK_DIAG}>
+    EINK_PROFILE=$<BOOL:${EINK_PROFILE}>
+    # Настройки библиотеки (все необязательные, значения по умолчанию - в epd4g/include/epd4g_config.h):
+    # EPD4G_KEEP_POWER=0
+    # EPD4G_FULL_SHAKE_RP=1
+    # EPD4G_T_BLACK=45
 )
 
 # Remove wrong libob.a library dependency when using cpp files
@@ -82,4 +84,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
 
     # Add user defined libraries
+    epd4g
 )

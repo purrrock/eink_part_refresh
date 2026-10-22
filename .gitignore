@@ -50,3 +50,8 @@ venv/
 Thumbs.db
 
 tests/data
+
+# host-тесты библиотеки epd4g
+epd4g/tests/t_default
+epd4g/tests/t_variant
+epd4g/tests/gen_golden
