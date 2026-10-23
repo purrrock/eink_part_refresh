@@ -5,7 +5,10 @@
 
 * the stock 4-gray LUT table `lut_stock[]` in `src/epd4g.c`;
 * the controller register sequence of `epd4g_init()` (the stock `EPD_2IN7_V2_Init_4GRAY`);
-* the RAM bit encoding of the 4-gray image (verified byte for byte by `tests/`).
+* the RAM bit encoding of the 4-gray image (verified byte for byte by `tests/`);
+* the 1-bit mode (`epd4g_bw_*`): the register sequences of the stock `EPD_2IN7_V2_Init`, `_Init_Fast`,
+  `_Display_Base`, `_Display_Fast`, `_Clear`, `_Display_Partial` and `_Sleep` and their display-update
+  control bytes (`0xF7`, `0xC7`, `0xFF`), verified byte for byte by `tests/`.
 
 The Waveshare file carries the following permission notice, which applies to those parts:
 

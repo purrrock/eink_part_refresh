@@ -163,33 +163,116 @@ uint32_t epd4g_mask_from_diff(uint8_t *mask, const uint8_t *prev, const uint8_t 
 }
 
 #if EPD4G_INTERNAL_MASK
-/* One scratch mask shared by epd4g_partial_diff() and epd4g_partial_rect(). */
+/* One scratch mask shared by the partial_diff / partial_rect helpers. A running job reads it, so the
+ * start functions refuse (EPD4G_ERR_BUSY) while a job is in progress. */
 static uint8_t s_mask[EPD4G_MASK_BYTES];
 
-int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
-                       const epd4g_rect_t *roi, uint32_t *changed)
+int epd4g_start_partial_diff(const uint8_t *prev, const uint8_t *cur,
+                             const epd4g_rect_t *roi, uint32_t *changed)
 {
     uint32_t n;
 
     if (prev == NULL || cur == NULL)
         return EPD4G_ERR_PARAM;
+    if (epd4g_is_busy())
+        return EPD4G_ERR_BUSY;
     n = epd4g_mask_from_diff(s_mask, prev, cur, roi);
     if (changed != NULL)
         *changed = n;
     if (n == 0)
         return EPD4G_OK;
-    return epd4g_partial(cur, s_mask);
+    return epd4g_start_partial(cur, s_mask);
 }
 
-int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
+int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
 {
     if (fb == NULL || rect == NULL)
         return EPD4G_ERR_PARAM;
     if (rect->x0 > rect->x1 || rect->y0 > rect->y1 ||
         rect->x1 < 0 || rect->y1 < 0 || rect->x0 >= EPD4G_WIDTH || rect->y0 >= EPD4G_HEIGHT)
         return EPD4G_ERR_PARAM;
+    if (epd4g_is_busy())
+        return EPD4G_ERR_BUSY;
     epd4g_mask_clear(s_mask);
     epd4g_mask_set_rect(s_mask, rect);
-    return epd4g_partial(fb, s_mask);
+    return epd4g_start_partial(fb, s_mask);
+}
+
+int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
+                       const epd4g_rect_t *roi, uint32_t *changed)
+{
+    int rc = epd4g_start_partial_diff(prev, cur, roi, changed);
+    if (rc != EPD4G_OK || !epd4g_is_busy())
+        return rc;                                  /* error, or nothing changed */
+    return epd4g_wait();
+}
+
+int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
+{
+    int rc = epd4g_start_partial_rect(fb, rect);
+    return rc != EPD4G_OK ? rc : epd4g_wait();
 }
 #endif
+
+/* ------------------------------ 1-bit frame ------------------------------- */
+void epd4g_bw_fb_fill(uint8_t *fb, int white)
+{
+    memset(fb, white ? 0xFF : 0x00, EPD4G_BW_FB_BYTES);
+}
+
+void epd4g_bw_fb_set(uint8_t *fb, int x, int y, int white)
+{
+    if (x < 0 || y < 0 || x >= EPD4G_WIDTH || y >= EPD4G_HEIGHT)
+        return;
+    size_t i = (size_t)y * EPD4G_BW_STRIDE + (size_t)(x >> 3);
+    uint8_t m = (uint8_t)(0x80u >> (x & 7));
+    if (white) fb[i] |= m; else fb[i] &= (uint8_t)~m;
+}
+
+int epd4g_bw_fb_get(const uint8_t *fb, int x, int y)
+{
+    if (x < 0 || y < 0 || x >= EPD4G_WIDTH || y >= EPD4G_HEIGHT)
+        return EPD4G_BW_WHITE;
+    return (fb[(size_t)y * EPD4G_BW_STRIDE + (size_t)(x >> 3)] >> (7 - (x & 7))) & 1;
+}
+
+void epd4g_bw_fb_set_rot(uint8_t *fb, epd4g_rot_t rot, int x, int y, int white)
+{
+    int nx, ny;
+    if (epd4g_map(rot, x, y, &nx, &ny) == 0)
+        epd4g_bw_fb_set(fb, nx, ny, white);
+}
+
+int epd4g_bw_fb_get_rot(const uint8_t *fb, epd4g_rot_t rot, int x, int y)
+{
+    int nx, ny;
+    if (epd4g_map(rot, x, y, &nx, &ny) != 0)
+        return EPD4G_BW_WHITE;
+    return epd4g_bw_fb_get(fb, nx, ny);
+}
+
+void epd4g_bw_fb_copy_rect(uint8_t *dst, const uint8_t *src, const epd4g_rect_t *r)
+{
+    int x0 = r->x0 < 0 ? 0 : r->x0, x1 = r->x1 >= EPD4G_WIDTH ? EPD4G_WIDTH - 1 : r->x1;
+    int y0 = r->y0 < 0 ? 0 : r->y0, y1 = r->y1 >= EPD4G_HEIGHT ? EPD4G_HEIGHT - 1 : r->y1;
+    if (x0 > x1 || y0 > y1)
+        return;
+    for (int y = y0; y <= y1; y++) {
+        size_t o = (size_t)y * EPD4G_BW_STRIDE + (size_t)(x0 >> 3);
+        memcpy(&dst[o], &src[o], (size_t)((x1 >> 3) - (x0 >> 3) + 1));
+    }
+}
+
+void epd4g_fb_to_bw(uint8_t *bw, const uint8_t *fb)
+{
+    for (int y = 0; y < EPD4G_HEIGHT; y++)
+        for (int xb = 0; xb < EPD4G_BW_STRIDE; xb++) {
+            uint8_t v = 0;
+            for (int k = 0; k < 8; k++) {
+                int x = xb * 8 + k;
+                if (epd4g_fb_get(fb, x, y) >= EPD4G_BW_THRESHOLD)
+                    v |= (uint8_t)(0x80u >> k);
+            }
+            bw[(size_t)y * EPD4G_BW_STRIDE + (size_t)xb] = v;
+        }
+}

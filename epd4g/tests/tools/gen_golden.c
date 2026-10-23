@@ -47,6 +47,36 @@ int main(void)
     printf("#define GOLDEN_PLANE24_LEN %d\n#define GOLDEN_PLANE24_FNV 0x%08Xu\n", n24, fnv(p24, n24));
     printf("#define GOLDEN_PLANE26_LEN %d\n#define GOLDEN_PLANE26_FNV 0x%08Xu\n", n26, fnv(p26, n26));
 
+    /* ---- 1-bit mode ---- */
+    static uint8_t bw[5808], win[5808];
+    s = 777;
+    for (int i = 0; i < 5808; i++) { s = s * 1103515245u + 12345u; bw[i] = (uint8_t)(s >> 16); }
+    printf("#define GOLDEN_BW_SEED 777u\n");
+
+    n = 0; EPD_2IN7_V2_Init();
+    printf("static const uint16_t golden_bw_init[] = {");
+    for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);
+    printf(" };\n");
+    n = 0; EPD_2IN7_V2_Init_Fast();
+    printf("static const uint16_t golden_bw_init_fast[] = {");
+    for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);
+    printf(" };\n");
+
+    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Display_Base(bw);
+    printf("#define GOLDEN_BWBASE_P24_FNV 0x%08Xu\n#define GOLDEN_BWBASE_P26_FNV 0x%08Xu\n", fnv(p24, n24), fnv(p26, n26));
+    printf("#define GOLDEN_BWBASE_LEN %d\n", n24);
+    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Display_Fast(bw);
+    printf("#define GOLDEN_BWFAST_P24_FNV 0x%08Xu\n", fnv(p24, n24));
+    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Clear();
+    printf("#define GOLDEN_BWCLEAR_P24_FNV 0x%08Xu\n", fnv(p24, n24));
+
+    /* partial window: pixels x 16..87, rows 40..99 (the stock call takes exclusive ends and a packed window buffer) */
+    for (int y = 40; y < 100; y++) memcpy(&win[(y - 40) * 9], &bw[y * 22 + 2], 9);
+    n = 0; EPD_2IN7_V2_Display_Partial(win, 16, 40, 88, 100);
+    {   uint32_t h = 2166136261u;
+        for (int i = 0; i < n; i++) { h ^= stream[i] & 0xFF; h *= 16777619u; h ^= stream[i] >> 8; h *= 16777619u; }
+        printf("#define GOLDEN_BWPART_LEN %d\n#define GOLDEN_BWPART_FNV 0x%08Xu\n", n, h); }
+
     n = 0; EPD_2IN7_V2_Sleep();
     printf("static const uint16_t golden_sleep[] = {");
     for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);

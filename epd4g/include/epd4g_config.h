@@ -74,6 +74,44 @@
 #endif
 
 /* ------------------------------------------------------------------------- *
+ * Non-blocking operation
+ * ------------------------------------------------------------------------- */
+/** Rows of RAM data (22 or 44 bytes each) sent per epd4g_poll() call. One row takes ~0.1 ms with
+ *  HAL polling SPI at 8 MHz, so 8 rows ~ 1 ms. Lower = more responsive main loop, higher = fewer polls. */
+#ifndef EPD4G_ROWS_PER_POLL
+#define EPD4G_ROWS_PER_POLL  8
+#endif
+
+/* ------------------------------------------------------------------------- *
+ * 1-bit (black/white) mode, see epd4g_bw.h. The defaults reproduce the stock Waveshare
+ * sequence exactly (OTP waveforms, hardware reset before every partial update).
+ * ------------------------------------------------------------------------- */
+/** Level at which a 2-bit pixel becomes white when a 4-gray frame is used as 1-bit source
+ *  (EPD4G_SRC_2BPP): pixel value >= threshold -> white. 2 = light gray and white are white. */
+#ifndef EPD4G_BW_THRESHOLD
+#define EPD4G_BW_THRESHOLD   2
+#endif
+
+/** 1 = hardware reset before every 1-bit partial update, as the stock Display_Partial() does
+ *  (~42 ms). 0 = skip it (faster, NOT verified on hardware). */
+#ifndef EPD4G_BW_PARTIAL_RESET
+#define EPD4G_BW_PARTIAL_RESET 1
+#endif
+
+/** 1 = 1-bit updates leave the analog part powered (0xFC / 0xF4 / 0xC4 instead of 0xFF / 0xF7 /
+ *  0xC7), saves ~300 ms per update; call epd4g_power_off() when idle. Needs
+ *  EPD4G_BW_PARTIAL_RESET=0. NOT verified on hardware, so off by default. */
+#ifndef EPD4G_BW_KEEP_POWER
+#define EPD4G_BW_KEEP_POWER  0
+#endif
+
+/** Value of the border register (0x3C) that a 1-bit full refresh restores after a partial update
+ *  (the partial update sets 0x80). 0x05 is the controller's reset default. */
+#ifndef EPD4G_BW_BORDER_FULL
+#define EPD4G_BW_BORDER_FULL 0x05
+#endif
+
+/* ------------------------------------------------------------------------- *
  * Optional features / diagnostics (all off by default, zero cost when off)
  * ------------------------------------------------------------------------- */
 

@@ -118,13 +118,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-      if (eink_demo_step() != 0) {
+      /* Не блокирует: пока панель рисует, цикл крутится свободно (здесь же обрабатывайте GNSS и кнопки). */
+      if (eink_demo_task() != 0) {
 #if EINK_DIAG
-        printf("[FATAL] eink_demo_step failed; animation stopped\r\n");
+        printf("[FATAL] eink_demo_task failed; animation stopped\r\n");
 #endif
         while (1) { HAL_Delay(1000); }
       }
-      // HAL_Delay(300); // задержка между кадрами анимации если движение получится слишком быстрым
   }
   /* USER CODE END 3 */
 }

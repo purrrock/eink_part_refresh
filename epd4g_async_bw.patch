@@ -1,0 +1,2346 @@
+diff --git a/Core/Inc/eink_demo.h b/Core/Inc/eink_demo.h
+index 8e9e82e..b08f2f4 100644
+--- a/Core/Inc/eink_demo.h
++++ b/Core/Inc/eink_demo.h
+@@ -7,9 +7,10 @@
+ /* Returns 0 on success, -1 on a display/SPI/BUSY error. */
+ int eink_demo_init(void);
+ 
+-/* Один шаг анимации: сдвиг треугольника + частичное обновление окна. Блокирует до конца BUSY. */
++/* Неблокирующий шаг демо: вызывать из while(1) как можно чаще. Возвращает управление за ~1 мс.
++ * Когда панель свободна, запускает следующее обновление (кадр 4 gray, либо шаг 1-bit меню). */
+ /* Returns 0 on success, -1 on a display/SPI/BUSY error. */
+-int eink_demo_step(void);
++int eink_demo_task(void);
+ 
+ /* Длительность последнего обновления (мс) — удобно смотреть в отладчике. */
+ uint32_t eink_demo_last_update_ms(void);
+diff --git a/Core/Src/eink_demo.c b/Core/Src/eink_demo.c
+index 082878f..705e2c9 100644
+--- a/Core/Src/eink_demo.c
++++ b/Core/Src/eink_demo.c
+@@ -10,6 +10,11 @@
+  *   3. Каждое EINK_FULL_REFRESH_EVERY-е обновление (по умолчанию 8-е) - полное
+  *      обновление (epd4g_full(EPD4G_FULL_FAST)), чтобы сбросить накопленные следы.
+  *
++ *   4. Основной цикл НЕ блокируется: eink_demo_task() вызывается из while(1) в main.c и только
++ *      продвигает автомат библиотеки (epd4g_poll()); пока панель рисует, main-цикл свободен
++ *      (приём GNSS, кнопки и т. п.). Каждые EINK_BW_EVERY кадров демо переключается в 1-bit режим
++ *      («меню» с курсором, быстрое частичное обновление), затем возвращается в 4 gray.
++ *
+  * Это пример использования; библиотека от этого файла не зависит.
+  *
+  * Настройки (-D... в CMakeLists.txt):
+@@ -18,11 +23,15 @@
+  *   EINK_ROT                 ориентация, EPD4G_ROT_90 (альбомная) по умолчанию
+  *   EINK_FULL_REFRESH_EVERY  период полного обновления, 0 - никогда
+  *   EINK_STEP_X / EINK_STEP_Y  шаг треугольника за кадр, px
++ *   EINK_BW_DEMO             1 - показывать 1-bit «меню» (по умолчанию 1), 0 - только 4 gray
++ *   EINK_BW_EVERY            через сколько кадров 4 gray переключаться в 1-bit меню
++ *   EINK_BW_STEPS            сколько шагов курсора показать в 1-bit меню
+  */
+ 
+ #include "eink_demo.h"
+ #include "epd4g.h"
+ #include "epd4g_fb.h"
++#include "epd4g_bw.h"
+ #include "main.h"           /* HAL_GetTick() */
+ #include <string.h>
+ 
+@@ -63,6 +72,16 @@
+ #define EINK_STEP_Y         3
+ #endif
+ 
++#ifndef EINK_BW_DEMO
++#define EINK_BW_DEMO        1
++#endif
++#ifndef EINK_BW_EVERY
++#define EINK_BW_EVERY       12
++#endif
++#ifndef EINK_BW_STEPS
++#define EINK_BW_STEPS       10
++#endif
++
+ #define CELL        22                      /* 264/22 = 12, 176/22 = 8 */
+ #define TRI_R       10                      /* запас вокруг центра треугольника */
+ 
+@@ -222,29 +241,168 @@ int eink_demo_init(void)
+     return 0;
+ }
+ 
+-int eink_demo_step(void)
++/* ---------------------- неблокирующий автомат демо ------------------------- */
++
++/* Что запустить следующим, когда библиотека освободится. */
++typedef enum {
++    A_GRAY_FRAME,       /* кадр анимации 4 gray (или переход в 1-bit меню)         */
++    A_BW_FULL,          /* 1-bit init выполнен: полное обновление меню             */
++    A_BW_STEP,          /* шаг курсора меню частичным обновлением                  */
++    A_GRAY_FULL         /* 4-gray init выполнен: полное обновление 4 gray          */
++} action_t;
++
++#define MENU_ROWS   6
++#define MENU_ROW_H  26
++#define MENU_Y0     6
++
++static uint8_t bw[EPD4G_BW_FB_BYTES];       /* кадр 1-bit меню */
++static action_t s_act = A_GRAY_FRAME;
++static int  s_job;                          /* запущена задача, результат ещё не проверен */
++static uint32_t s_job_t0;
++static uint32_t s_loops;                    /* проходов main-цикла за время задачи */
++static int  s_frames, s_bw_steps, s_sel;
++
++static void bw_rect_fill(int x0, int y0, int x1, int y1, int white)
+ {
+-    const int lw = epd4g_logical_width(EINK_ROT), lh = epd4g_logical_height(EINK_ROT);
+-    int ox = s_x, oy = s_y;
++    for (int y = y0; y <= y1; y++)
++        for (int x = x0; x <= x1; x++)
++            epd4g_bw_fb_set_rot(bw, EINK_ROT, x, y, white);
++}
++
++/* строка меню: рамка 2 px; выбранная - залита чёрным с белой «меткой» слева */
++static epd4g_rect_t bw_draw_row(int i, int selected)
++{
++    const int lw = epd4g_logical_width(EINK_ROT);
++    const int y0 = MENU_Y0 + i * MENU_ROW_H, y1 = y0 + MENU_ROW_H - 3;
++    epd4g_rect_t r = {0, 0, 0, 0};
+ 
+-    memcpy(prev, cur, sizeof prev);         /* то, что сейчас на панели */
++    bw_rect_fill(6, y0, lw - 7, y1, 1);
++    bw_rect_fill(8, y0, lw - 9, y1, 0);                 /* чёрный прямоугольник */
++    if (!selected)
++        bw_rect_fill(10, y0 + 2, lw - 11, y1 - 2, 1);   /* внутри белый: остаётся рамка */
++    else
++        bw_rect_fill(14, y0 + 6, 30, y1 - 6, 1);        /* метка */
++    bw_rect_fill(40, y0 + 8, 40 + 20 * (i + 2), y0 + 12, selected ? 1 : 0);   /* «текст» */
++    epd4g_map_rect(EINK_ROT, 6, y0, lw - 7, y1, &r);
++    return r;
++}
+ 
+-    s_x += s_dx;
+-    s_y += s_dy;
+-    if (s_x < 14 || s_x > lw - 15) { s_dx = -s_dx; s_x += 2 * s_dx; }
+-    if (s_y < 14 || s_y > lh - 15) { s_dy = -s_dy; s_y += 2 * s_dy; }
++static void bw_render_menu(void)
++{
++    epd4g_bw_fb_fill(bw, 1);
++    for (int i = 0; i < MENU_ROWS; i++)
++        bw_draw_row(i, i == s_sel);
++}
+ 
+-    epd4g_rect_t r = rect_union(rect_around(ox, oy), rect_around(s_x, s_y));
+-    DIAG("[FRAME] triangle (%d,%d)->(%d,%d)\r\n", ox, oy, s_x, s_y);
+-    epd4g_fb_copy_rect(cur, bg, &r);        /* стереть старый треугольник фоном */
+-    draw_triangle(s_x, s_y);
+-    if (push_update(&r) != 0) {
+-        DIAG("[ERROR][FRAME] frame update failed; aborting animation\r\n");
++static int job_started(int rc)
++{
++    if (rc != EPD4G_OK) {
++        DIAG("[ERROR][TASK] start failed rc=%d\r\n", rc);
+         return -1;
+     }
++    if (epd4g_is_busy()) {
++        s_job = 1; s_job_t0 = HAL_GetTick(); s_loops = 0;
++    }
+     return 0;
+ }
+ 
++/* Запускает обновление текущего кадра 4 gray (prev -> cur). */
++static int start_gray_update(const epd4g_rect_t *roi)
++{
++    uint32_t changed = 0;
++
++    s_upd_cnt++;
++#if EINK_FULL_REFRESH_EVERY > 0
++    if (s_upd_cnt >= (uint32_t)EINK_FULL_REFRESH_EVERY) {
++        s_upd_cnt = 0;
++        DIAG("[UPDATE] FULL refresh (every %d-th update)\r\n", EINK_FULL_REFRESH_EVERY);
++        return job_started(epd4g_start_full(cur, EPD4G_FULL_FAST));
++    }
++#endif
++    int rc = epd4g_start_partial_diff(prev, cur, roi, &changed);
++    DIAG("[UPDATE] #%lu rect X=%d..%d Y=%d..%d, pixels in mask=%lu\r\n",
++         (unsigned long)s_upd_cnt, roi->x0, roi->x1, roi->y0, roi->y1, (unsigned long)changed);
++    return job_started(rc);
++}
++
++static int start_next(void)
++{
++    switch (s_act) {
++    case A_GRAY_FRAME: {
++#if EINK_BW_DEMO
++        if (s_frames >= EINK_BW_EVERY) {
++            DIAG("[MODE] 4 gray -> 1 bit\r\n");
++            s_frames = 0; s_bw_steps = 0; s_sel = 0;
++            s_act = A_BW_FULL;
++            return job_started(epd4g_start_bw_init(EPD4G_BW_NORMAL));
++        }
++#endif
++        const int lw = epd4g_logical_width(EINK_ROT), lh = epd4g_logical_height(EINK_ROT);
++        int ox = s_x, oy = s_y;
++
++        s_frames++;
++        memcpy(prev, cur, sizeof prev);     /* то, что сейчас на панели */
++        s_x += s_dx;
++        s_y += s_dy;
++        if (s_x < 14 || s_x > lw - 15) { s_dx = -s_dx; s_x += 2 * s_dx; }
++        if (s_y < 14 || s_y > lh - 15) { s_dy = -s_dy; s_y += 2 * s_dy; }
++
++        epd4g_rect_t r = rect_union(rect_around(ox, oy), rect_around(s_x, s_y));
++        DIAG("[FRAME] triangle (%d,%d)->(%d,%d)\r\n", ox, oy, s_x, s_y);
++        epd4g_fb_copy_rect(cur, bg, &r);    /* стереть старый треугольник фоном */
++        draw_triangle(s_x, s_y);
++        return start_gray_update(&r);       /* cur и prev не трогаем, пока задача не закончится */
++    }
++    case A_BW_FULL:
++        bw_render_menu();
++        s_act = A_BW_STEP;
++        DIAG("[MODE] 1-bit full refresh\r\n");
++        return job_started(epd4g_start_bw_full(bw, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL));
++    case A_BW_STEP: {
++        if (s_bw_steps >= EINK_BW_STEPS) {
++            DIAG("[MODE] 1 bit -> 4 gray\r\n");
++            s_act = A_GRAY_FULL;
++            return job_started(epd4g_start_init());
++        }
++        epd4g_rect_t a = bw_draw_row(s_sel, 0);
++        s_sel = (s_sel + 1) % MENU_ROWS;
++        epd4g_rect_t b = bw_draw_row(s_sel, 1);
++        epd4g_rect_t r = rect_union(a, b);
++        s_bw_steps++;
++        DIAG("[UPDATE] 1-bit cursor -> row %d\r\n", s_sel);
++        return job_started(epd4g_start_bw_partial(bw, EPD4G_SRC_1BPP, &r));
++    }
++    case A_GRAY_FULL:
++        s_act = A_GRAY_FRAME;
++        memcpy(prev, cur, sizeof prev);
++        s_upd_cnt = 0;
++        return job_started(epd4g_start_full(cur, EPD4G_FULL_DEEP));
++    }
++    return -1;
++}
++
++/* Вызывать из while(1) в main.c как можно чаще. Возвращает 0, либо -1 при ошибке дисплея. */
++int eink_demo_task(void)
++{
++    s_loops++;
++    epd4g_poll();
++    if (epd4g_is_busy())
++        return 0;                           /* панель рисует, main-цикл свободен */
++
++    if (s_job) {                            /* задача только что закончилась */
++        int rc = epd4g_result();
++        s_job = 0;
++        s_last_ms = HAL_GetTick() - s_job_t0;
++        if (rc != EPD4G_OK) {
++            DIAG("[ERROR][TASK] job failed rc=%d after %lu ms\r\n", rc, (unsigned long)s_last_ms);
++            return -1;
++        }
++        DIAG("[UPDATE] complete in %lu ms, main loop passes meanwhile: %lu\r\n",
++             (unsigned long)s_last_ms, (unsigned long)s_loops);
++    }
++    return start_next();
++}
++
+ uint32_t eink_demo_last_update_ms(void)
+ {
+     return s_last_ms;
+diff --git a/Core/Src/main.c b/Core/Src/main.c
+index 138b54c..bb76f34 100644
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -118,13 +118,13 @@ int main(void)
+     /* USER CODE END WHILE */
+ 
+     /* USER CODE BEGIN 3 */
+-      if (eink_demo_step() != 0) {
++      /* Не блокирует: пока панель рисует, цикл крутится свободно (здесь же обрабатывайте GNSS и кнопки). */
++      if (eink_demo_task() != 0) {
+ #if EINK_DIAG
+-        printf("[FATAL] eink_demo_step failed; animation stopped\r\n");
++        printf("[FATAL] eink_demo_task failed; animation stopped\r\n");
+ #endif
+         while (1) { HAL_Delay(1000); }
+       }
+-      // HAL_Delay(300); // задержка между кадрами анимации если движение получится слишком быстрым
+   }
+   /* USER CODE END 3 */
+ }
+diff --git a/README.md b/README.md
+index 8fe2eb8..670de3f 100644
+--- a/README.md
++++ b/README.md
+@@ -4,6 +4,8 @@
+ 
+ Документация Waveshare описывает partial refresh только для 1-битного режима. Библиотека `epd4g` делает его для **2 бит на пиксель (4 серых)**: перерисовываются только пиксели из маски, остальной экран не мигает. Заодно в 2 раза ускорено полное обновление.
+ 
++Библиотека также содержит **1-bit режим** (`epd4g_bw.h`: init / fast init / full / fast full / clear / partial / sleep, последовательности штатного драйвера Waveshare, сверены с ним побайтно) и **неблокирующий интерфейс** (`epd4g_start_*()` + `epd4g_poll()`): пока панель рисует, основной цикл свободен. Сабмодуль Waveshare проекту больше не нужен.
++
+ | Анимация (треугольник движется по фону из 4 серых) | |
+ |---|---|
+ | ![фото 1](Docs/1.jpg) | ![фото 2](Docs/2.jpg) |
+@@ -19,7 +21,7 @@
+ 2. [Быстрый старт](#быстрый-старт)
+ 3. [Подключение к своему проекту](#подключение-к-своему-проекту)
+ 4. [Порт на другую платформу](#порт-на-другую-платформу)
+-5. [Справочник API](#справочник-api)
++5. [Справочник API](#справочник-api) (в т.ч. [неблокирующий режим](#неблокирующий-режим) и [1-bit режим](#1-bit-режим))
+ 6. [Конфигурация](#конфигурация)
+ 7. [Как это работает](#как-это-работает)
+ 8. [Подбор параметров](#подбор-параметров)
+@@ -173,21 +175,73 @@ SPI mode 0, MSB first. Строка кадра передаётся блоком
+ 
+ ## Справочник API
+ 
+-Все функции блокирующие, не реентерабельные, не потокобезопасные. Возврат: `0` (`EPD4G_OK`) или код ошибки.
++Функции без суффикса блокирующие (возвращаются, когда панель закончила), у каждой есть неблокирующий двойник `epd4g_start_*`, см. [ниже](#неблокирующий-режим). Не реентерабельные, не потокобезопасные, из прерываний не вызывать. Возврат: `0` (`EPD4G_OK`) или код ошибки.
+ 
+ | Функция | Описание |
+ |---|---|
+ | `int epd4g_init(void)` | Аппаратный сброс и настройка регистров (последовательность штатной `Init_4GRAY`). Вызывать при старте, после `epd4g_sleep()` и после ошибки `EPD4G_ERR_TIMEOUT`. |
+ | `int epd4g_full(fb, mode)` | Полное обновление всего экрана (экран мигает). `EPD4G_FULL_FAST` — укороченная «встряска», ≈ 2,9 с. `EPD4G_FULL_DEEP` — штатная волна Waveshare, ≈ 5,3 с, лучше всего убирает следы. |
+-| `int epd4g_partial(fb, mask)` | Перерисовать только пиксели с битом 1 в `mask`; серые берутся из `fb`. ≈ 1,4 с. Нужно, чтобы на панели уже была известная картинка (после `epd4g_full`). |
++| `int epd4g_partial(fb, mask)` | Перерисовать только пиксели с битом 1 в `mask`; серые берутся из `fb`. ≈ 1,4 с. Нужно, чтобы на панели уже была известная картинка (после `epd4g_full`). Если среди маскированных пикселей нет серых (только чёрный и белый), второй проход пропускается: волна ≈ 0,9 с вместо ≈ 1,1 с. |
+ | `int epd4g_partial_diff(prev, cur, roi, &changed)` | Сравнить `prev` (на экране) и `cur` (должно быть), перерисовать ровно отличающиеся пиксели. `roi` — ограничение области (NULL = весь экран), `changed` — число отличий (можно NULL). Если отличий нет, панель не трогается. |
+ | `int epd4g_partial_rect(fb, rect)` | Перерисовать прямоугольник (нативные координаты, включительно). |
+ | `int epd4g_power_off(void)` | Выключить аналоговую часть панели (нужно при `EPD4G_KEEP_POWER=1`, когда экран надолго простаивает). Следующее обновление включит её снова (≈ +0,3 с один раз). |
+-| `int epd4g_sleep(void)` | Выключить питание и перевести в deep sleep. Для пробуждения — `epd4g_init()`. |
++| `int epd4g_sleep(void)` | Выключить питание и перевести в deep sleep, из любого режима. Для пробуждения — `epd4g_init()` или `epd4g_bw_init()`. |
+ 
+ `epd4g_partial_rect` и `epd4g_partial_diff` используют общий внутренний буфер маски (`EPD4G_INTERNAL_MASK=1`, по умолчанию) и находятся в `epd4g_fb.c`.
+ 
+-**Коды ошибок:** `EPD4G_ERR_TIMEOUT` (-1) — BUSY не опустился за `EPD4G_BUSY_TIMEOUT_MS` (после этого нужен `epd4g_init()`); `EPD4G_ERR_NOT_INIT` (-2); `EPD4G_ERR_PARAM` (-3) — NULL или пустой прямоугольник; `EPD4G_ERR_IO` (-4) — ошибка `epd4g_port_spi_write`.
++**Коды ошибок:** `EPD4G_ERR_TIMEOUT` (-1) — BUSY не опустился за `EPD4G_BUSY_TIMEOUT_MS` (после этого нужен `epd4g_init()`); `EPD4G_ERR_NOT_INIT` (-2); `EPD4G_ERR_PARAM` (-3) — NULL или пустой прямоугольник; `EPD4G_ERR_IO` (-4) — ошибка `epd4g_port_spi_write`; `EPD4G_ERR_BUSY` (-5) — предыдущая задача ещё выполняется (неблокирующий режим); `EPD4G_ERR_MODE` (-6) — панель инициализирована в другом режиме (4 gray / 1-bit) или в 1-bit загружена не та волна: вызовите нужный init; `EPD4G_ERR_NO_BASE` (-7) — 1-bit partial без предшествующего `epd4g_bw_full()` после init.
++
++### Неблокирующий режим
++
++Каждая операция — «задача» небольшого кооперативного автомата. Блокирующие функции — это `start` + цикл `poll`, реализация одна.
++
++| Функция | Описание |
++|---|---|
++| `epd4g_start_init/full/partial/power_off/sleep(...)`, `epd4g_start_partial_diff/rect(...)`, `epd4g_start_bw_*(...)` | Те же аргументы и проверки, что у блокирующих. Ставят задачу и сразу возвращаются: `EPD4G_OK` или код ошибки (тогда ничего не запущено; `EPD4G_ERR_BUSY`, если уже идёт другая задача). |
++| `int epd4g_poll(void)` | Продвигает задачу. Возвращает `EPD4G_PENDING` (1), пока задача идёт, и `0`, когда задачи нет или она закончилась. Не блокирует: один вызов не дольше ≈ 1 мс (`EPD4G_ROWS_PER_POLL` строк SPI-данных, либо одна проверка BUSY/таймера). Вызывать каждый проход главного цикла. |
++| `epd4g_is_busy()`, `epd4g_result()` | Идёт ли задача; код завершения последней задачи. |
++| `epd4g_data_busy()` | 1, пока задача ещё может читать переданные буферы. Падает в 0, как только последние данные ушли в RAM панели (до конца волны, т. е. 0,3–2,5 с): можно рисовать следующий кадр в тот же буфер, но новая задача стартует только после `epd4g_is_busy() == 0`. |
++| `epd4g_set_done_cb(cb, ctx)` | Необязательный обратный вызов из `epd4g_poll()` по завершении (может запустить следующую задачу). |
++| `epd4g_wait()` | Блокирующее ожидание конца текущей задачи. |
++| `epd4g_abort()` | Бросить задачу, не дожидаясь панели; после этого нужен `init`. |
++
++```c
++epd4g_start_partial_diff(prev, cur, &roi, &changed);   // вернулось сразу
++while (1) {
++    epd4g_poll();               // ≤ ~1 мс
++    gnss_parse();               // приём данных, кнопки и т. д. продолжают работать
++    buttons_poll();
++    if (!epd4g_is_busy() && ...) { /* можно менять cur/prev, запускать следующее обновление */ }
++}
++```
++
++Правила: пока `epd4g_data_busy()` равен 1, буферы, переданные в `start` (`fb`, `mask`, `img`), менять нельзя; одновременно выполняется одна задача (очередь и «слияние» запросов, например «только последний кадр», делает приложение); SPI идёт кусками по `EPD4G_ROWS_PER_POLL` строк, CS отпускается после каждого куска, так что SPI1 можно временно делить с другим кодом между вызовами `epd4g_poll()` только если он сам не трогает пины DC/CS дисплея. Время ожидания BUSY (десятки и сотни мс при каждом обновлении) главный цикл теперь использует сам.
++
++Изменения CubeMX для неблокирующего режима не нужны: SPI идёт опросом, без DMA. Если одного `epd4g_poll()` в ≈ 1 мс всё же много, уменьшите `EPD4G_ROWS_PER_POLL`; дальнейшее ускорение возможно DMA-портом (`epd4g_port_spi_write` остаётся блокирующим).
++
++### 1-bit режим
++
++`epd4g_bw.h`. Заменяет драйвер Waveshare `EPD_2in7_V2`.
++
++| Функция | Аналог в драйвере Waveshare |
++|---|---|
++| `epd4g_bw_init(EPD4G_BW_NORMAL)` | `EPD_2IN7_V2_Init` |
++| `epd4g_bw_init(EPD4G_BW_FAST)` | `EPD_2IN7_V2_Init_Fast` |
++| `epd4g_bw_full(img, src, EPD4G_BW_NORMAL)` | `Display_Base` (обе плоскости RAM, `0xF7`) |
++| `epd4g_bw_full(img, src, EPD4G_BW_FAST)` | `Display_Fast` (`0xC7`; нужен `bw_init(FAST)` и отсутствие partial после него) |
++| `epd4g_bw_clear(mode)` | `Clear` |
++| `epd4g_bw_partial(img, src, rect)` | `Display_Partial` (окно RAM, `0xFF`, аппаратный сброс перед обновлением) |
++| `epd4g_sleep()` | `Sleep` (deep sleep) |
++
++* **Формат** `img`: `EPD4G_SRC_1BPP` — 1 бит на пиксель, 22 байта на строку, `EPD4G_BW_FB_BYTES` = 5 808 байт, 1 = белый (формат Waveshare); `EPD4G_SRC_2BPP` — кадр 4 gray (`EPD4G_FB_BYTES`), преобразуется в 1-bit построчно при передаче (пиксель ≥ `EPD4G_BW_THRESHOLD` → белый), дополнительного буфера не нужно; `EPD4G_SRC_WHITE` — всё белое.
++* `epd4g_bw_partial` получает **весь кадр** и прямоугольник `rect` в нативных координатах (включительно, x расширяется до границы байта, `NULL` = весь экран); передаются только строки окна. Панель сама хранит старую и новую картинку в двух плоскостях RAM, копия `prev` на МК не нужна.
++* Помощники для 1-bit буфера (`epd4g_fb.h`): `epd4g_bw_fb_fill/set/get`, `epd4g_bw_fb_set_rot/get_rot`, `epd4g_bw_fb_copy_rect`, `epd4g_fb_to_bw`.
++
++**Сон.** `epd4g_sleep()` в 1-bit режиме сохраняет RAM панели, поэтому штатный цикл «Init + Display_Base + Sleep … Display_Partial + Sleep» работает: `epd4g_bw_partial()` будит панель своим аппаратным сбросом (`EPD4G_BW_PARTIAL_RESET=1`). Полное обновление после сна требует `epd4g_bw_init()`; повторный `epd4g_sleep()` ничего не делает.
++
++**Переключение режимов** (карта ↔ меню): `epd4g_bw_init()` и `epd4g_init()` оба делают аппаратный сброс (если после прошлого обновления аналоговая часть оставалась включённой, сначала выключают её). После любого из них первое обновление должно быть полным (`epd4g_bw_full` / `epd4g_full`); `epd4g_bw_partial` до этого вернёт `EPD4G_ERR_NO_BASE`.
++
++**Отличия от штатного драйвера** (намеренные): `epd4g_bw_full` перед каждой плоскостью явно ставит курсор RAM, а после partial возвращает окно RAM и регистр границы (`0x3C`, `EPD4G_BW_BORDER_FULL`); таймаут BUSY вместо бесконечного ожидания; пауза после BUSY 2 мс вместо 20 (`EPD4G_BUSY_SETTLE_MS`).
+ 
+ ### Формат буфера кадра
+ 
+@@ -219,6 +273,11 @@ SPI mode 0, MSB first. Строка кадра передаётся блоком
+ | `EPD4G_FULL_SHAKE_RP` | 0 | повторов группы «встряски» в `FULL_FAST` минус 1: 3 = штатная волна (262 кадра), 1 = 178 кадров, 0 = 136 |
+ | `EPD4G_FULL_SHAKE_TP` | 20 | длительность фаз «встряски», кадров |
+ | `EPD4G_KEEP_POWER` | 1 | 1 — аналоговая часть остаётся включённой после обновления (быстрее, нужен `epd4g_power_off()` при простое); 0 — панель включается и выключается вокруг каждого прохода (≈ +330 мс на проход) |
++| `EPD4G_ROWS_PER_POLL` | 8 | строк данных RAM за один `epd4g_poll()` (≈ 0,1 мс на строку); меньше — отзывчивее главный цикл |
++| `EPD4G_BW_THRESHOLD` | 2 | 1-bit из 4 gray: пиксели ≥ порога белые (2: светло-серый и белый → белый) |
++| `EPD4G_BW_PARTIAL_RESET` | 1 | 1 — аппаратный сброс перед каждым 1-bit partial, как в штатном драйвере (≈ 42 мс); 0 — без него (быстрее, на железе не проверено) |
++| `EPD4G_BW_KEEP_POWER` | 0 | 1 — 1-bit обновления оставляют аналоговую часть включённой (≈ −300 мс на обновление, `0xFC/0xF4/0xC4`; требует `EPD4G_BW_PARTIAL_RESET=0`; на железе не проверено) |
++| `EPD4G_BW_BORDER_FULL` | 0x05 | значение регистра границы после partial для 1-bit full |
+ | `EPD4G_BUSY_TIMEOUT_MS` | 10000 | таймаут ожидания BUSY |
+ | `EPD4G_BUSY_POLL_MS` | 1 | пауза между опросами BUSY (`epd4g_port_delay_ms`) |
+ | `EPD4G_BUSY_SETTLE_MS` | 2 | пауза после спада BUSY (в штатной библиотеке 20) |
+@@ -287,7 +346,7 @@ SPI mode 0, MSB first. Строка кадра передаётся блоком
+ 
+ ```sh
+ make -C epd4g/tests            # основной прогон
+-make -C epd4g/tests variants   # те же тесты с другими настройками (KEEP_POWER=0, RP=1/3, другие T_*, PROFILE)
++make -C epd4g/tests variants   # те же тесты с другими настройками (KEEP_POWER=0, RP=1/3, другие T_*, PROFILE, ROWS_PER_POLL, BW_*)
+ ```
+ 
+ Тесты подставляют вместо железа симулятор панели за интерфейсом порта и проверяют:
+@@ -295,17 +354,19 @@ make -C epd4g/tests variants   # те же тесты с другими наст
+ * **совместимость со штатной библиотекой Waveshare побайтно** (эталон `tests/golden.inc` снят с неё скриптом `tests/tools/gen_golden.c`): последовательность `epd4g_init()`, LUT штатной волны, биты обеих плоскостей RAM для 4-gray картинки, команда сна;
+ * **модель чернил**: к каждому пикселю применяются LUT и данные RAM, которые отправила библиотека (VSH темнит, VSL светлит, насыщение на краях). После каждого частичного обновления все пиксели должны показывать целевой серый, а немаскированные — не сдвинуться. Проверены все 16 переходов серых и маски 1–100 %;
+ * длительность проходов (53 кадра при настройках по умолчанию, 136 у быстрого полного, 262 у `DEEP`), команды питания (`0xC4`/`0xC7`/`0x83`), таймаут BUSY, ошибки SPI, параметры;
++* **1-bit режим**: побайтовое совпадение со штатным драйвером (последовательности `Init`, `Init_Fast`, `Display_Partial`, `Sleep` целиком, данные обеих плоскостей `Display_Base`, `Display_Fast`, `Clear`, управляющие байты `0xF7/0xC7/0xFF`); модель памяти контроллера (окно, курсор, старая/новая плоскость): после каждого full/partial панель показывает ровно ожидаемую картинку, вне окна ничего не меняется; режимы и ошибки (`ERR_MODE`, `ERR_NO_BASE`), сон и пробуждение;
++* **неблокирующий интерфейс**: за один `epd4g_poll()` отправляется ограниченное число байт и время не проходит, главный цикл крутится всё время волны, те же байты, что у блокирующего вызова, `ERR_BUSY`, обратный вызов, `abort`, таймаут;
+ * помощники: поворот (биекция для всех ориентаций), маски, копирование прямоугольников.
+ 
+ Чувствительность проверена мутациями (испорченный регистр инициализации, перепутанные строки LUT, полярность битов и т.д. — каждая ловится тестом).
+ 
+-**Что тесты не доказывают:** модель чернил идеальная, реальное поведение панели (глубина чёрного, следы) проверяется только на железе; соответствие пары RAM → строка LUT взято как допущение модели. `epd4g_sleep()`/`epd4g_power_off()` сверены со штатными командами, но на железе не запускались.
++**Что тесты не доказывают:** модель чернил идеальная, реальное поведение панели (глубина чёрного, следы) проверяется только на железе; соответствие пары RAM → строка LUT взято как допущение модели. `epd4g_sleep()`/`epd4g_power_off()` сверены со штатными командами, но на железе не запускались. 1-bit режим сверен с кодом Waveshare, но на железе не запускался; допущение модели: после обновления контроллер сам копирует новую плоскость RAM в старую (на этом построен и штатный `Display_Partial`).
+ 
+ Обновить эталон: `make -C epd4g/tests golden WS=<путь к e-Paper>/STM32/STM32-F103ZET6/User/e-Paper`.
+ 
+ ## Демо-проект
+ 
+-Корень репозитория — проект STM32CubeMX для STM32F411CEU6 (HSI 16 МГц, без PLL), собирается в VS Code с расширением STM32Cube (CMake, пресеты `Debug` / `Release`). Демо рисует фон из квадратов 22×22 px четырёх серых и двигает по нему треугольник; каждое 8-е обновление — полное.
++Корень репозитория — проект STM32CubeMX для STM32F411CEU6 (HSI 16 МГц, без PLL), собирается в VS Code с расширением STM32Cube (CMake, пресеты `Debug` / `Release`). Демо рисует фон из квадратов 22×22 px четырёх серых и двигает по нему треугольник; каждое 8-е обновление — полное. Цикл `main` не блокируется (`eink_demo_task()` вызывает `epd4g_poll()`), а каждые `EINK_BW_EVERY` кадров демо переключается в 1-bit режим (меню с курсором, быстрое частичное обновление) и обратно в 4 gray, то есть так же, как это будет делать навигатор.
+ 
+ ```sh
+ cmake --preset Debug
+@@ -319,7 +380,7 @@ cmake --build build/Debug
+ | `EINK_DIAG` | ON | журнал в USART2 (printf). OFF — без `printf`, прошивка ≈ 9,5 КБ |
+ | `EINK_PROFILE` | OFF | печать времени по фазам, включает `EPD4G_PROFILE` |
+ 
+-Параметры демо (`-D…` в `CMakeLists.txt`): `EINK_ROT` (ориентация), `EINK_FULL_REFRESH_EVERY` (период полного обновления, 0 — никогда), `EINK_STEP_X`, `EINK_STEP_Y`.
++Параметры демо (`-D…` в `CMakeLists.txt`): `EINK_ROT` (ориентация), `EINK_FULL_REFRESH_EVERY` (период полного обновления, 0 — никогда), `EINK_STEP_X`, `EINK_STEP_Y`, `EINK_BW_DEMO` (0 — без 1-bit фазы), `EINK_BW_EVERY`, `EINK_BW_STEPS`.
+ 
+ Файлы: `Core/Src/eink_demo.c` — демо на API библиотеки; `Core/Src/main.c` — стандартный код CubeMX, пользовательские вставки в `USER CODE`; `eink_part_refresh.ioc` — конфигурация CubeMX. При перегенерации кода в CubeMX метки пинов должны остаться `EINK_CS`, `EINK_DC`, `EINK_RST`, `EINK_BUSY`.
+ 
+@@ -327,8 +388,8 @@ cmake --build build/Debug
+ 
+ ```
+ epd4g/                      библиотека (то, что подключают как сабмодуль)
+-  include/                  epd4g.h, epd4g_fb.h, epd4g_port.h, epd4g_config.h
+-  src/                      epd4g.c (ядро), epd4g_fb.c (помощники)
++  include/                  epd4g.h, epd4g_bw.h, epd4g_fb.h, epd4g_port.h, epd4g_config.h
++  src/                      epd4g.c (ядро: автомат, 4 gray, 1-bit), epd4g_fb.c (помощники)
+   port/stm32_hal/           порт под STM32 HAL
+   tests/                    хост-тесты, эталон Waveshare, генератор эталона
+   CMakeLists.txt            INTERFACE-библиотека epd4g
+@@ -344,8 +405,8 @@ Docs/                       фото результата, лог измерен
+ * Предполагается, что `prev` в точности соответствует тому, что на панели. Если оно разошлось (сбой, питание), сделайте `epd4g_full`.
+ * Остаточные следы накапливаются; периодически нужно полное обновление (в демо каждое 8-е). Влияние частых обновлений на срок службы панели не исследовалось.
+ * Температурной компенсации нет: волны фиксированные.
+-* Функции блокирующие. Для RTOS вызывайте из одной задачи; `epd4g_port_delay_ms` в BUSY-цикле можно сделать точкой переключения.
+-* `epd4g_sleep()` и `epd4g_power_off()` на железе не проверены.
++* Неблокирующий режим кооперативный: нужен регулярный вызов `epd4g_poll()` (из главного цикла или одной задачи RTOS), не из прерываний. SPI передаётся опросом (без DMA), между вызовами `epd4g_poll()` главный цикл занят максимум ≈ 1 мс. Блокирующие функции по-прежнему есть.
++* `epd4g_sleep()`, `epd4g_power_off()` и весь 1-bit режим на железе не проверены (сверены с кодом Waveshare и моделью на хосте).
+ 
+ ## Лицензия и благодарности
+ 
+diff --git a/TODO.md b/TODO.md
+index 6a87f17..580cb4f 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -8,7 +8,18 @@
+ - [x] Хост-тесты с моделью чернил и сверкой с штатной библиотекой Waveshare.
+ - [x] README.md.
+ 
++- [x] Неблокирующий режим (`epd4g_start_*` + `epd4g_poll()`), блокирующие функции — обёртки над ним.
++- [x] 1-bit режим `epd4g_bw_*` (init / fast init / full / fast full / clear / partial / sleep) по последовательностям Waveshare, с эталонными тестами.
++- [x] Второй проход 4-gray partial пропускается, если среди маскированных пикселей нет серых.
++
++## Проверить на железе
++- [ ] 1-bit partial и full: качество и время относительно штатного драйвера Waveshare.
++- [ ] Переключение 4 gray ↔ 1 bit (демо `EINK_BW_DEMO=1`): нет ли артефактов после смены режима.
++- [ ] Допущение: контроллер сам копирует новую плоскость RAM в старую после обновления (на этом построен и штатный `Display_Partial`).
++- [ ] Опции `EPD4G_BW_PARTIAL_RESET=0` и `EPD4G_BW_KEEP_POWER=1` (быстрее на ≈ 40 мс и ≈ 300 мс, не проверялись).
++
+ ## Идеи (не проверялись на железе)
++- [ ] SPI через DMA (нужны SPI1_TX DMA и прерывание в CubeMX): сейчас SPI опросом, главный цикл занят ≈ 1 мс за вызов `epd4g_poll()`.
+ - [ ] SPI: сейчас ~63 мс на проход (HAL по 22 байта на строку). DMA или один блок на плоскость сэкономит несколько десятков мс.
+ - [ ] Постоянная часть ~110-130 мс на каждую команду 0x20 - выяснить, можно ли её сократить.
+ - [ ] Подбор `EPD4G_T_*` при другой температуре (волны подобраны при комнатной).
+diff --git a/epd4g/NOTICE.md b/epd4g/NOTICE.md
+index e0d19de..f176a52 100644
+--- a/epd4g/NOTICE.md
++++ b/epd4g/NOTICE.md
+@@ -5,7 +5,10 @@
+ 
+ * the stock 4-gray LUT table `lut_stock[]` in `src/epd4g.c`;
+ * the controller register sequence of `epd4g_init()` (the stock `EPD_2IN7_V2_Init_4GRAY`);
+-* the RAM bit encoding of the 4-gray image (verified byte for byte by `tests/`).
++* the RAM bit encoding of the 4-gray image (verified byte for byte by `tests/`);
++* the 1-bit mode (`epd4g_bw_*`): the register sequences of the stock `EPD_2IN7_V2_Init`, `_Init_Fast`,
++  `_Display_Base`, `_Display_Fast`, `_Clear`, `_Display_Partial` and `_Sleep` and their display-update
++  control bytes (`0xF7`, `0xC7`, `0xFF`), verified byte for byte by `tests/`.
+ 
+ The Waveshare file carries the following permission notice, which applies to those parts:
+ 
+diff --git a/epd4g/include/epd4g.h b/epd4g/include/epd4g.h
+index c659cd8..f88546b 100644
+--- a/epd4g/include/epd4g.h
++++ b/epd4g/include/epd4g.h
+@@ -21,8 +21,23 @@
+  *   }
+  * @endcode
+  *
+- * Not re-entrant, every call blocks until the panel is done (partial ~1.4 s,
+- * full ~2.9 s with the default configuration). Not thread-safe.
++ * Two ways to call the library (both drive the same state machine):
++ *
++ *   blocking      epd4g_init(), epd4g_full(), epd4g_partial(), ... return when the panel
++ *                 is done (partial ~1.4 s, full ~2.9 s with the default configuration).
++ *
++ *   non-blocking  epd4g_start_xxx() only queues the job and returns at once; call
++ *                 epd4g_poll() from the main loop until it returns 0. One poll call takes
++ *                 about a millisecond at most (EPD4G_ROWS_PER_POLL rows of SPI data, or one
++ *                 BUSY / timer check), so GNSS parsing, buttons etc. keep running while the
++ *                 panel is drawing. The buffers passed to a start function must stay
++ *                 unchanged until the job is finished.
++ *
++ * Besides the 4-gray mode this library has a 1-bit (black/white) mode with its own fast
++ * partial refresh, see epd4g_bw.h. The two modes share the panel and the state machine;
++ * epd4g_init() / epd4g_bw_init() switch between them.
++ *
++ * Not re-entrant and not thread-safe: call everything from one context (not from an ISR).
+  */
+ #ifndef EPD4G_H
+ #define EPD4G_H
+@@ -64,9 +79,16 @@ enum {
+     EPD4G_ERR_TIMEOUT   = -1,  /**< BUSY did not fall within EPD4G_BUSY_TIMEOUT_MS; call epd4g_init() again */
+     EPD4G_ERR_NOT_INIT  = -2,  /**< epd4g_init() was not called (or the panel is asleep / timed out) */
+     EPD4G_ERR_PARAM     = -3,  /**< NULL pointer or empty rectangle */
+-    EPD4G_ERR_IO        = -4   /**< epd4g_port_spi_write() failed */
++    EPD4G_ERR_IO        = -4,  /**< epd4g_port_spi_write() failed */
++    EPD4G_ERR_BUSY      = -5,  /**< another job is still running (non-blocking API) */
++    EPD4G_ERR_MODE      = -6,  /**< the panel is initialised in the other mode (4-gray vs 1-bit), or the
++                                    fast 1-bit LUT is no longer loaded: call the matching init first */
++    EPD4G_ERR_NO_BASE   = -7   /**< 1-bit partial needs a previous epd4g_bw_full() after epd4g_bw_init() */
+ };
+ 
++/** Returned by epd4g_poll() (not an error): the job is still running, call again. */
++#define EPD4G_PENDING   1
++
+ typedef enum {
+     EPD4G_FULL_FAST = 0,  /**< shortened shake group (EPD4G_FULL_SHAKE_*): ~2.9 s with defaults */
+     EPD4G_FULL_DEEP = 1   /**< stock Waveshare 262-frame waveform: ~5.3 s, best ghost removal   */
+@@ -79,7 +101,8 @@ typedef struct {
+ 
+ /* ------------------------------- API ------------------------------------ */
+ 
+-/** Hardware reset and register setup (identical to the stock Init_4GRAY sequence).
++/** Hardware reset and register setup (identical to the stock Init_4GRAY sequence). Also the way
++ *  to switch from the 1-bit mode back to 4 gray; follow it by epd4g_full().
+  *  Call once at start and after epd4g_sleep() or a timeout. */
+ int epd4g_init(void);
+ 
+@@ -89,11 +112,14 @@ int epd4g_full(const uint8_t *fb, epd4g_full_mode_t mode);
+ 
+ /** Partial refresh: only the pixels set in @p mask are redrawn, taking their target
+  *  grays from @p fb. Pixels with a 0 mask bit must hold on the panel what @p fb
+- *  holds for them. Requires a previous epd4g_full() so that the panel content is known. */
++ *  holds for them. Requires a previous epd4g_full() so that the panel content is known.
++ *  If no masked pixel is gray (only black and white) the second pass is skipped: ~0.9 s
++ *  instead of ~1.1 s of waveform with the default configuration. */
+ int epd4g_partial(const uint8_t *fb, const uint8_t *mask);
+ 
+ #if EPD4G_INTERNAL_MASK
+-/* The two helpers below live in epd4g_fb.c and share one internal 5808-byte mask buffer. */
++/* The helpers below live in epd4g_fb.c and share one internal 5808-byte mask buffer, which a
++ * running (non-blocking) job keeps in use: the start functions return EPD4G_ERR_BUSY meanwhile. */
+ 
+ /** Partial refresh of a rectangle (native coordinates, inclusive). */
+ int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
+@@ -104,17 +130,68 @@ int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
+  *  if there are none the panel is not touched and 0 is returned. */
+ int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
+                        const epd4g_rect_t *roi, uint32_t *changed);
++
++/** Non-blocking twins. If epd4g_start_partial_diff() reports *changed == 0 no job was started
++ *  (and the panel is not touched). @p cur must stay unchanged until the job is finished;
++ *  @p prev is only read inside the call. */
++int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
++int epd4g_start_partial_diff(const uint8_t *prev, const uint8_t *cur,
++                             const epd4g_rect_t *roi, uint32_t *changed);
+ #endif
+ 
++/* ------------------------- non-blocking interface ------------------------- *
++ * Every epd4g_start_xxx() has the same arguments and checks as its blocking twin. It returns
++ * EPD4G_OK when the job was queued (progress it with epd4g_poll()), or an error code
++ * (EPD4G_ERR_BUSY if a job is already running, EPD4G_ERR_PARAM, EPD4G_ERR_NOT_INIT,
++ * EPD4G_ERR_MODE, ...) and then nothing was started. Only one job runs at a time. */
++int epd4g_start_init(void);
++int epd4g_start_full(const uint8_t *fb, epd4g_full_mode_t mode);
++int epd4g_start_partial(const uint8_t *fb, const uint8_t *mask);
++int epd4g_start_power_off(void);
++int epd4g_start_sleep(void);
++
++/** Advance the running job. Returns EPD4G_PENDING (1) while it is still running and 0 when no
++ *  job is running (finished or none). Call it often (every main-loop pass); it never blocks,
++ *  a call takes about a millisecond at most. The outcome of a finished job is epd4g_result(). */
++int epd4g_poll(void);
++
++/** 1 while a job is running (between a successful start and the poll that returned 0). */
++int epd4g_is_busy(void);
++
++/** 1 while the running job may still read the buffers given to its start function (frame, mask,
++ *  image). It drops to 0 as soon as the last RAM data is sent, long before the job ends (the panel
++ *  waveform takes 0.3 .. 2.5 s): from then on the caller may draw the next frame into the same
++ *  buffer, but a new epd4g_start_xxx() still returns EPD4G_ERR_BUSY until epd4g_is_busy() is 0. */
++int epd4g_data_busy(void);
++
++/** Status code of the last finished job (EPD4G_OK or an error). */
++int epd4g_result(void);
++
++/** Optional: called from epd4g_poll() when a job has finished, with its status code. The
++ *  callback may start the next job. Pass NULL to remove it. */
++typedef void (*epd4g_done_cb_t)(int rc, void *ctx);
++void epd4g_set_done_cb(epd4g_done_cb_t cb, void *ctx);
++
++/** Blocking helper: poll until the running job is finished (sleeping EPD4G_BUSY_POLL_MS between
++ *  BUSY checks through epd4g_port_delay_ms()) and return its status. */
++int epd4g_wait(void);
++
++/** Forget the running job without waiting for the panel. The panel is then considered
++ *  uninitialised: call epd4g_init() / epd4g_bw_init() before the next update. */
++void epd4g_abort(void);
++
+ /** Power the panel's analog part down. Only needed with EPD4G_KEEP_POWER=1 when the
+  *  display goes idle; the next update powers it up again (adds ~300 ms once). */
+ int epd4g_power_off(void);
+ 
+-/** Power down and enter deep sleep (lowest consumption). Call epd4g_init() to wake up. */
++/** Power down and enter deep sleep (lowest consumption), from either mode.
++ *  Call epd4g_init() / epd4g_bw_init() to wake up. */
+ int epd4g_sleep(void);
+ 
+ #ifdef EPD4G_PROFILE
+-/** Phase durations of the last update, ms. A full refresh fills setup/spi1/wait1 only. */
++/** Phase durations of the last update, ms (wall time, includes time the main loop spent elsewhere
++ *  when the non-blocking API is used). A full refresh fills setup/spi1/wait1 only; a partial
++ *  update without gray pixels skips pass 2 (spi2 = wait2 = 0). */
+ typedef struct {
+     uint16_t setup;    /**< registers + LUT of pass 1            */
+     uint16_t spi1;     /**< RAM planes of pass 1                 */
+diff --git a/epd4g/include/epd4g_bw.h b/epd4g/include/epd4g_bw.h
+new file mode 100644
+index 0000000..b569875
+--- /dev/null
++++ b/epd4g/include/epd4g_bw.h
+@@ -0,0 +1,92 @@
++/**
++ * @file epd4g_bw.h
++ * @brief 1-bit (black/white) mode of the Waveshare 2.7" e-Paper HAT V2, 264x176.
++ *
++ * Replaces the stock EPD_2in7_V2 driver: the init, fast init, full, fast full, clear, partial
++ * and sleep sequences are the stock ones (verified byte for byte by tests/ against the vendor
++ * library), with the same non-blocking state machine as the 4-gray mode (epd4g.h).
++ *
++ * Typical use:
++ * @code
++ *   epd4g_start_bw_init(EPD4G_BW_NORMAL);   // or the blocking epd4g_bw_init()
++ *   ... poll until done ...
++ *   epd4g_start_bw_full(img, EPD4G_SRC_2BPP, EPD4G_BW_NORMAL);   // baseline picture, flashes
++ *   ... poll until done ...
++ *   epd4g_start_bw_partial(img, EPD4G_SRC_2BPP, &rect);          // ~0.3-0.5 s, only that window
++ * @endcode
++ *
++ * The panel keeps the old and the new picture in two RAM planes and compares them itself, so
++ * no copy of the previous frame is needed on the MCU. A partial update draws the window rows
++ * of the image you pass; everything outside the window is untouched.
++ *
++ * Sleep: epd4g_sleep() in the 1-bit mode keeps the RAM planes. The stock flow "Init + Display_Base +
++ * Sleep ... Display_Partial + Sleep" therefore works: epd4g_bw_partial() wakes the panel with its
++ * hardware reset (EPD4G_BW_PARTIAL_RESET=1). A full refresh after sleep needs epd4g_bw_init() first.
++ *
++ * Mode switching: epd4g_init() (4 gray) and epd4g_bw_init() both reset the panel. After either
++ * of them the first update must be a full one (epd4g_full() / epd4g_bw_full()).
++ */
++#ifndef EPD4G_BW_H
++#define EPD4G_BW_H
++
++#include "epd4g.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** 1-bit frame buffer: 1 bit per pixel, MSB first, 1 = white, 0 = black, 22 bytes per row,
++ *  264 rows, 5808 bytes (the stock Waveshare format, native portrait orientation). */
++#define EPD4G_BW_STRIDE     (EPD4G_WIDTH / 8)
++#define EPD4G_BW_FB_BYTES   (EPD4G_BW_STRIDE * EPD4G_HEIGHT)
++#define EPD4G_BW_BLACK      0
++#define EPD4G_BW_WHITE      1
++
++/** Format of the image passed to the 1-bit update functions. */
++typedef enum {
++    EPD4G_SRC_1BPP  = 0,   /**< EPD4G_BW_FB_BYTES buffer, see above                                  */
++    EPD4G_SRC_2BPP  = 1,   /**< a 4-gray frame buffer (EPD4G_FB_BYTES), converted row by row while
++                                it is sent: pixel >= EPD4G_BW_THRESHOLD -> white. No extra buffer.  */
++    EPD4G_SRC_WHITE = 2    /**< all white, the image pointer is ignored (may be NULL)                */
++} epd4g_src_t;
++
++typedef enum {
++    EPD4G_BW_NORMAL = 0,   /**< stock Init / Display: temperature-compensated OTP waveform, ~2 s     */
++    EPD4G_BW_FAST   = 1    /**< stock Init_Fast / Display_Fast: shorter waveform, ~1 s               */
++} epd4g_bw_mode_t;
++
++/* ----------------------------- blocking API ------------------------------- */
++
++/** Reset and register setup (stock EPD_2IN7_V2_Init, or _Init_Fast for EPD4G_BW_FAST).
++ *  Switches the panel to 1-bit mode. */
++int epd4g_bw_init(epd4g_bw_mode_t mode);
++
++/** Full refresh from @p img, written to both RAM planes (stock Display_Base). EPD4G_BW_FAST needs
++ *  epd4g_bw_init(EPD4G_BW_FAST) and no partial update since (a partial update loads another
++ *  waveform): otherwise EPD4G_ERR_MODE. */
++int epd4g_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode);
++
++/** Full refresh to white (stock Clear). */
++int epd4g_bw_clear(epd4g_bw_mode_t mode);
++
++/** Partial refresh of @p rect (native coordinates, inclusive; x is widened to whole bytes, i.e.
++ *  8 pixel columns; NULL = whole screen). The rows of @p img inside the window are sent, so
++ *  @p img is a full-screen frame. Needs a previous epd4g_bw_full() after epd4g_bw_init(),
++ *  otherwise EPD4G_ERR_NO_BASE. */
++int epd4g_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t *rect);
++
++/* --------------------------- non-blocking API ---------------------------- */
++/* Same arguments and checks as above; see epd4g.h (epd4g_poll(), epd4g_result(), ...).
++ * @p img must stay unchanged until the job is finished. */
++int epd4g_start_bw_init(epd4g_bw_mode_t mode);
++int epd4g_start_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode);
++int epd4g_start_bw_clear(epd4g_bw_mode_t mode);
++int epd4g_start_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t *rect);
++
++/* Deep sleep and power-off work in both modes: epd4g_sleep(), epd4g_power_off() (epd4g.h). */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* EPD4G_BW_H */
+diff --git a/epd4g/include/epd4g_config.h b/epd4g/include/epd4g_config.h
+index 7e2f520..4a32c0f 100644
+--- a/epd4g/include/epd4g_config.h
++++ b/epd4g/include/epd4g_config.h
+@@ -73,6 +73,44 @@
+ #define EPD4G_BUSY_SETTLE_MS   2U       /**< pause after BUSY falls (stock Waveshare code uses 20) */
+ #endif
+ 
++/* ------------------------------------------------------------------------- *
++ * Non-blocking operation
++ * ------------------------------------------------------------------------- */
++/** Rows of RAM data (22 or 44 bytes each) sent per epd4g_poll() call. One row takes ~0.1 ms with
++ *  HAL polling SPI at 8 MHz, so 8 rows ~ 1 ms. Lower = more responsive main loop, higher = fewer polls. */
++#ifndef EPD4G_ROWS_PER_POLL
++#define EPD4G_ROWS_PER_POLL  8
++#endif
++
++/* ------------------------------------------------------------------------- *
++ * 1-bit (black/white) mode, see epd4g_bw.h. The defaults reproduce the stock Waveshare
++ * sequence exactly (OTP waveforms, hardware reset before every partial update).
++ * ------------------------------------------------------------------------- */
++/** Level at which a 2-bit pixel becomes white when a 4-gray frame is used as 1-bit source
++ *  (EPD4G_SRC_2BPP): pixel value >= threshold -> white. 2 = light gray and white are white. */
++#ifndef EPD4G_BW_THRESHOLD
++#define EPD4G_BW_THRESHOLD   2
++#endif
++
++/** 1 = hardware reset before every 1-bit partial update, as the stock Display_Partial() does
++ *  (~42 ms). 0 = skip it (faster, NOT verified on hardware). */
++#ifndef EPD4G_BW_PARTIAL_RESET
++#define EPD4G_BW_PARTIAL_RESET 1
++#endif
++
++/** 1 = 1-bit updates leave the analog part powered (0xFC / 0xF4 / 0xC4 instead of 0xFF / 0xF7 /
++ *  0xC7), saves ~300 ms per update; call epd4g_power_off() when idle. Needs
++ *  EPD4G_BW_PARTIAL_RESET=0. NOT verified on hardware, so off by default. */
++#ifndef EPD4G_BW_KEEP_POWER
++#define EPD4G_BW_KEEP_POWER  0
++#endif
++
++/** Value of the border register (0x3C) that a 1-bit full refresh restores after a partial update
++ *  (the partial update sets 0x80). 0x05 is the controller's reset default. */
++#ifndef EPD4G_BW_BORDER_FULL
++#define EPD4G_BW_BORDER_FULL 0x05
++#endif
++
+ /* ------------------------------------------------------------------------- *
+  * Optional features / diagnostics (all off by default, zero cost when off)
+  * ------------------------------------------------------------------------- */
+diff --git a/epd4g/include/epd4g_fb.h b/epd4g/include/epd4g_fb.h
+index 089ec86..75043d1 100644
+--- a/epd4g/include/epd4g_fb.h
++++ b/epd4g/include/epd4g_fb.h
+@@ -6,6 +6,7 @@
+ #define EPD4G_FB_H
+ 
+ #include "epd4g.h"
++#include "epd4g_bw.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -55,6 +56,18 @@ void epd4g_mask_set_rect(uint8_t *mask, const epd4g_rect_t *rect);
+ uint32_t epd4g_mask_from_diff(uint8_t *mask, const uint8_t *prev, const uint8_t *cur,
+                               const epd4g_rect_t *roi);
+ 
++/* ----- 1-bit frame helpers (EPD4G_SRC_1BPP buffers, EPD4G_BW_FB_BYTES bytes, 1 = white) ----- */
++void epd4g_bw_fb_fill(uint8_t *fb, int white);
++void epd4g_bw_fb_set(uint8_t *fb, int x, int y, int white);        /**< native coordinates */
++int  epd4g_bw_fb_get(const uint8_t *fb, int x, int y);
++void epd4g_bw_fb_set_rot(uint8_t *fb, epd4g_rot_t rot, int x, int y, int white);   /**< logical */
++int  epd4g_bw_fb_get_rot(const uint8_t *fb, epd4g_rot_t rot, int x, int y);
++void epd4g_bw_fb_copy_rect(uint8_t *dst, const uint8_t *src, const epd4g_rect_t *rect);
++
++/** Convert a whole 4-gray frame to a 1-bit one (pixel >= EPD4G_BW_THRESHOLD -> white). Normally not
++ *  needed: pass the 4-gray frame with EPD4G_SRC_2BPP and it is converted while it is sent. */
++void epd4g_fb_to_bw(uint8_t *bw, const uint8_t *fb);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/epd4g/src/epd4g.c b/epd4g/src/epd4g.c
+index 4466905..f270250 100644
+--- a/epd4g/src/epd4g.c
++++ b/epd4g/src/epd4g.c
+@@ -22,11 +22,20 @@
+  * The RAM bits of a pixel are exactly the bits the stock 4-gray display routine writes,
+  * so which gray lands on which LUT row is the same as in the stock waveform.
+  *
++ * Non-blocking operation: every public operation is a "job" run by a small cooperative state
++ * machine (line-number coroutine, see the CR_ macros). epd4g_poll() advances the job until it
++ * has to wait (BUSY pin, a timer) or has sent EPD4G_ROWS_PER_POLL rows of RAM data, then
++ * returns. The blocking functions are start + poll loop, so there is a single implementation.
++ *
++ * 1-bit mode: the stock EPD_2in7_V2 sequences (Init, Init_Fast, Display_Base, Display_Fast,
++ * Clear, Display_Partial, Sleep), see epd4g_bw.h.
++ *
+  * Credits: the register sequence of epd4g_init() and the stock LUT table come from the
+  * Waveshare e-Paper library (https://github.com/waveshareteam/e-Paper, MIT-style
+  * license, (c) Waveshare team); see README.md.
+  */
+ #include "epd4g.h"
++#include "epd4g_bw.h"
+ #include "epd4g_port.h"
+ #include <string.h>
+ 
+@@ -43,13 +52,18 @@ EPD4G_STATIC_ASSERT(times_le_255,   EPD4G_T_BLACK <= 255 && EPD4G_T_WHITE <= 255
+                                     EPD4G_T_DARK <= 255 && EPD4G_FULL_SHAKE_TP <= 255 &&
+                                     EPD4G_FULL_SHAKE_RP <= 255);
+ EPD4G_STATIC_ASSERT(black_white_pos, EPD4G_T_BLACK >= 1 && EPD4G_T_WHITE >= 1);
++EPD4G_STATIC_ASSERT(rows_per_poll,  EPD4G_ROWS_PER_POLL >= 1);
++EPD4G_STATIC_ASSERT(bw_threshold,   EPD4G_BW_THRESHOLD >= 1 && EPD4G_BW_THRESHOLD <= 3);
++/* keeping the analog part on is incompatible with the hardware reset before a partial update */
++EPD4G_STATIC_ASSERT(bw_keep_vs_reset, !(EPD4G_BW_KEEP_POWER && EPD4G_BW_PARTIAL_RESET));
+ 
+ #ifdef EPD4G_PROFILE
+-#define PROF(field)  do { epd4g_prof.field = (uint16_t)(epd4g_port_tick_ms() - prof_t); \
+-                          prof_t = epd4g_port_tick_ms(); } while (0)
+-#define PROF_BEGIN() uint32_t prof_t = epd4g_port_tick_ms()
+ static epd4g_profile_t epd4g_prof;
++static uint32_t prof_t;
+ const epd4g_profile_t *epd4g_get_profile(void) { return &epd4g_prof; }
++#define PROF(field)  do { epd4g_prof.field = (uint16_t)(epd4g_port_tick_ms() - prof_t); \
++                          prof_t = epd4g_port_tick_ms(); } while (0)
++#define PROF_BEGIN() do { prof_t = epd4g_port_tick_ms(); memset(&epd4g_prof, 0, sizeof epd4g_prof); } while (0)
+ #else
+ #define PROF(field)  do { } while (0)
+ #define PROF_BEGIN() do { } while (0)
+@@ -76,8 +90,50 @@ static const uint8_t lut_stock[159] = {
+ };
+ 
+ /* ---------------------------- driver state ------------------------------- */
+-static uint8_t s_ready;      /* epd4g_init() done and no fatal error since */
+-static uint8_t s_io_err;     /* sticky: an SPI write failed during the current call */
++enum { MODE_NONE = 0, MODE_GRAY, MODE_BW };
++enum { JOB_NONE = 0, JOB_INIT, JOB_FULL, JOB_PARTIAL, JOB_BW_INIT, JOB_BW_FULL, JOB_BW_PARTIAL,
++       JOB_POWER_OFF, JOB_SLEEP };
++
++static uint8_t s_mode;        /* MODE_xxx: set when an init job has finished, cleared by a timeout / sleep */
++static uint8_t s_io_err;      /* sticky: an SPI write failed during the current job */
++static uint8_t s_powered;     /* analog part left powered by the last update (KEEP_POWER variants) */
++static uint8_t s_base;        /* 1-bit: a full update was done since the last init (RAM planes valid) */
++static uint8_t s_win_full;    /* 1-bit: RAM window registers cover the whole panel */
++static uint8_t s_border_part; /* 1-bit: border register still holds the partial-update value */
++static uint8_t s_fast_lut;    /* 1-bit: the Init_Fast waveform is loaded (EPD4G_BW_FAST full is possible) */
++static uint8_t s_asleep;      /* 1-bit: deep sleep entered; RAM planes kept, a partial update wakes the panel by its reset */
++static uint8_t s_data;        /* the running job may still read the caller's buffers */
++static uint8_t s_waiting;     /* the last poll stopped on a timer / BUSY wait (not on a data slice) */
++static int     s_result;      /* status of the last finished job */
++static epd4g_done_cb_t s_cb;
++static void   *s_cb_ctx;
++
++/* The running job. Everything a job needs after a yield lives here, locals do not survive. */
++static struct {
++    uint8_t  kind;            /* JOB_xxx */
++    uint16_t pc;              /* coroutine resume point */
++    int      rc;              /* result */
++    uint32_t t0;              /* start of the current wait */
++    int      bs;              /* busy_poll() result */
++    const uint8_t *fb;        /* 4-gray frame, 2 bpp */
++    const uint8_t *mask;
++    const void    *img;       /* 1-bit job source */
++    uint8_t  src;             /* epd4g_src_t */
++    uint8_t  fullmode;        /* epd4g_full_mode_t */
++    uint8_t  bwmode;          /* epd4g_bw_mode_t */
++    uint8_t  any_gray;        /* partial: some masked pixel is gray -> pass 2 needed */
++    int      xb0, xb1, y0, y1;  /* 1-bit partial window: byte columns, rows */
++    uint8_t  ctl;             /* value for register 0x22 */
++} J;
++
++/* The RAM plane being sent, in slices of EPD4G_ROWS_PER_POLL rows. */
++typedef enum { PASS_FULL, PASS_1, PASS_2, PASS_BW } pass_t;
++static struct {
++    uint8_t  plane;           /* 0 -> RAM 0x24, 1 -> RAM 0x26 */
++    pass_t   pass;
++    int      y, y1;
++    int      xb0, xb1;        /* PASS_BW: byte columns */
++} P;
+ 
+ /* --------------------------- low level access ---------------------------- */
+ static void spi(const uint8_t *p, size_t n)
+@@ -113,38 +169,61 @@ static void g_burst_end(void)
+     epd4g_port_gpio_cs(1);
+ }
+ 
+-/* returns 0 = ready, EPD4G_ERR_TIMEOUT otherwise */
+-static int g_busy(const char *where)
++/* ------------------------- coroutine helpers ------------------------------ */
++/* A job function is `switch (J.pc) { case 0: ... }`; a wait stores a unique case label in J.pc and
++ * returns, the next poll jumps back to it. __COUNTER__ makes the labels unique even when several
++ * macros sit on one source line. A job function returns 1 (pending) or 0 (finished, result in J.rc). */
++#define CR_BEGIN        switch (J.pc) { case 0:
++#define CR_END          } J.pc = 0; return 0
++#define CR_WAIT_N(cond, wait, n) \
++    do { J.pc = (uint16_t)((n) + 1); /* fallthrough */ case (n) + 1: \
++         if (!(cond)) { s_waiting = (wait); return 1; } } while (0)
++#define CR_WAIT(cond)   CR_WAIT_N(cond, 1, __COUNTER__)    /* timer / BUSY: sleep a bit */
++#define CR_SLICE(cond)  CR_WAIT_N(cond, 0, __COUNTER__)    /* more data to send: come back at once */
++#define FAIL(code)      do { J.rc = (code); J.pc = 0; return 0; } while (0)
++
++static int elapsed(uint32_t t0, uint32_t ms)
++{
++    return (uint32_t)(epd4g_port_tick_ms() - t0) >= ms;
++}
++
++#define WAIT_MS(ms)     do { J.t0 = epd4g_port_tick_ms(); CR_WAIT(elapsed(J.t0, (ms))); } while (0)
++
++/* 0 = still busy, 1 = ready, -1 = timeout (the panel is then considered uninitialised) */
++static int busy_poll(uint32_t t0, const char *where)
+ {
+-    uint32_t t0 = epd4g_port_tick_ms();
+     (void)where;                                             /* used by EPD4G_LOG only */
+-    while (epd4g_port_gpio_busy() != 0) {                    /* BUSY = 1 -> busy */
+-        if ((uint32_t)(epd4g_port_tick_ms() - t0) >= EPD4G_BUSY_TIMEOUT_MS) {
+-            EPD4G_LOG("[epd4g] BUSY timeout in %s\r\n", where);
+-            s_ready = 0;
+-            return EPD4G_ERR_TIMEOUT;
+-        }
+-        epd4g_port_delay_ms(EPD4G_BUSY_POLL_MS);
++    if (epd4g_port_gpio_busy() == 0)                         /* BUSY = 1 -> busy */
++        return 1;
++    if (elapsed(t0, EPD4G_BUSY_TIMEOUT_MS)) {
++        EPD4G_LOG("[epd4g] BUSY timeout in %s\r\n", where);
++        s_mode = MODE_NONE;
++        s_powered = 0;
++        return -1;
+     }
+-#if EPD4G_BUSY_SETTLE_MS > 0
+-    epd4g_port_delay_ms(EPD4G_BUSY_SETTLE_MS);
+-#endif
+-    return EPD4G_OK;
++    return 0;
+ }
+ 
+-/* Display update, LUT from register, mode 1.
+- * 0xC7 = clock+analog on, display, analog+clock off (stock, powers down)
+- * 0xC4 = clock+analog on, display, stay powered                         */
+-static int g_turn_on(const char *where)
++/* wait for BUSY low, then the settle pause (stock Waveshare code uses 20 ms) */
++#define WAIT_BUSY(where) \
++    do { J.t0 = epd4g_port_tick_ms(); \
++         CR_WAIT((J.bs = busy_poll(J.t0, (where))) != 0); \
++         if (J.bs < 0) FAIL(EPD4G_ERR_TIMEOUT); \
++         if (EPD4G_BUSY_SETTLE_MS > 0) WAIT_MS(EPD4G_BUSY_SETTLE_MS); } while (0)
++
++/* hardware reset pulse (same timing as the stock library) */
++#define HW_RESET() \
++    do { epd4g_port_gpio_cs(1); epd4g_port_gpio_dc(0); \
++         epd4g_port_gpio_rst(1); WAIT_MS(20); \
++         epd4g_port_gpio_rst(0); WAIT_MS(2); \
++         epd4g_port_gpio_rst(1); WAIT_MS(20); } while (0)
++
++/* Start a display update with register 0x22 = ctl (LUT from register or OTP, see callers). */
++static void g_trigger(uint8_t ctl)
+ {
+     g_cmd(0x22);
+-#if EPD4G_KEEP_POWER
+-    g_data(0xC4);
+-#else
+-    g_data(0xC7);
+-#endif
++    g_data(ctl);
+     g_cmd(0x20);
+-    return g_busy(where);
+ }
+ 
+ /* ------------------------------- LUT ------------------------------------- */
+@@ -214,13 +293,14 @@ static void lut_build_full(uint8_t *l, epd4g_full_mode_t mode)
+  * image byte into 4 plane bits (bit 3 = first pixel):
+  *   t24: inverted low pixel bit  (RAM 0x24, as in the stock 4-gray display routine)
+  *   t26: inverted high pixel bit (RAM 0x26)
+- *   tbk: pixel is black    tgr: pixel is light or dark gray                          */
+-static uint8_t t24[256], t26[256], tbk[256], tgr[256];
++ *   tbk: pixel is black    tgr: pixel is light or dark gray
++ *   tw : pixel >= EPD4G_BW_THRESHOLD (white in 1-bit mode)                                   */
++static uint8_t t24[256], t26[256], tbk[256], tgr[256], tw[256];
+ 
+ static void tables_init(void)
+ {
+     for (int b = 0; b < 256; b++) {
+-        uint8_t a = 0, c = 0, k = 0, g = 0;
++        uint8_t a = 0, c = 0, k = 0, g = 0, w = 0;
+         for (int j = 0; j < 4; j++) {
+             uint8_t px  = (uint8_t)((b >> (6 - 2 * j)) & 3);
+             uint8_t bit = (uint8_t)(1u << (3 - j));
+@@ -228,8 +308,9 @@ static void tables_init(void)
+             if (!(px & 2)) c |= bit;
+             if (px == 0)   k |= bit;
+             if (px == 1 || px == 2) g |= bit;
++            if (px >= EPD4G_BW_THRESHOLD) w |= bit;
+         }
+-        t24[b] = a; t26[b] = c; tbk[b] = k; tgr[b] = g;
++        t24[b] = a; t26[b] = c; tbk[b] = k; tgr[b] = g; tw[b] = w;
+     }
+ }
+ 
+@@ -238,37 +319,77 @@ static uint8_t pk(const uint8_t *t, const uint8_t *p)
+     return (uint8_t)((t[p[0]] << 4) | t[p[1]]);
+ }
+ 
+-typedef enum { PASS_FULL, PASS_1, PASS_2 } pass_t;
++/* 1 if some masked pixel has a gray target (pass 2 is needed) */
++static uint8_t mask_has_gray(const uint8_t *fb, const uint8_t *mask)
++{
++    for (int y = 0; y < EPD4G_HEIGHT; y++) {
++        const uint8_t *irow = fb + (size_t)y * EPD4G_FB_STRIDE;
++        const uint8_t *mrow = mask + (size_t)y * EPD4G_MASK_STRIDE;
++        for (int xb = 0; xb < EPD4G_MASK_STRIDE; xb++)
++            if (mrow[xb] && (pk(tgr, irow + xb * 2) & mrow[xb]))
++                return 1;
++    }
++    return 0;
++}
+ 
+-/* plane: 0 -> RAM 0x24, 1 -> RAM 0x26. mask bit 1 = pixel is updated (NULL = all).
++/* Begin sending a plane (command + row counters); plane_step() then sends the rows.
++ * plane: 0 -> RAM 0x24, 1 -> RAM 0x26. mask bit 1 = pixel is updated (NULL = all).
+  * RAM pair (0x24,0x26) per pixel: (0,0) keep; PASS_1: black (1,1), other masked (1,0);
+- * PASS_2: light/dark gray = the pair of the stock encoding, everything else (0,0). */
+-static void send_plane(uint8_t plane, pass_t pass, const uint8_t *fb, const uint8_t *mask)
++ * PASS_2: light/dark gray = the pair of the stock encoding, everything else (0,0).
++ * PASS_BW: 1 bit per pixel, rows y0..y1, byte columns xb0..xb1 of the 1-bit image. */
++static void plane_begin(uint8_t plane, pass_t pass, int y0, int y1, int xb0, int xb1)
++{
++    P.plane = plane; P.pass = pass;
++    P.y = y0; P.y1 = y1; P.xb0 = xb0; P.xb1 = xb1;
++    g_cmd(plane ? 0x26 : 0x24);
++}
++
++/* Send up to EPD4G_ROWS_PER_POLL rows; returns 1 while rows remain. CS is released after every
++ * slice, so nothing is left half-way when the main loop does other work in between. */
++static int plane_step(void)
+ {
+     uint8_t row[EPD4G_MASK_STRIDE];
+-    const uint8_t *t = plane ? t26 : t24;
++    int rows = EPD4G_ROWS_PER_POLL;
+ 
+-    g_cmd(plane ? 0x26 : 0x24);
+     g_burst_begin();
+-    for (int y = 0; y < EPD4G_HEIGHT; y++) {
+-        const uint8_t *irow = fb + (size_t)y * EPD4G_FB_STRIDE;
+-        const uint8_t *mrow = mask ? mask + (size_t)y * EPD4G_MASK_STRIDE : NULL;
+-        for (int xb = 0; xb < EPD4G_MASK_STRIDE; xb++) {
+-            const uint8_t *p = irow + xb * 2;
+-            uint8_t m = mrow ? mrow[xb] : 0xFF;
+-            uint8_t out;
+-            if (pass == PASS_FULL)   out = pk(t, p);
+-            else if (m == 0)         out = 0;                              /* keep */
+-            else if (pass == PASS_1) out = plane ? (uint8_t)(m & pk(tbk, p)) : m;
+-            else                     out = (uint8_t)(pk(t, p) & m & pk(tgr, p));
+-            row[xb] = out;
++    while (P.y <= P.y1 && rows-- > 0) {
++        const int y = P.y++;
++        if (P.pass == PASS_BW) {
++            const int n = P.xb1 - P.xb0 + 1;
++            if (J.src == EPD4G_SRC_1BPP) {
++                spi((const uint8_t *)J.img + (size_t)y * EPD4G_BW_STRIDE + P.xb0, (size_t)n);
++            } else {
++                if (J.src == EPD4G_SRC_WHITE) {
++                    memset(row, 0xFF, (size_t)n);
++                } else {
++                    const uint8_t *irow = (const uint8_t *)J.img + (size_t)y * EPD4G_FB_STRIDE;
++                    for (int i = 0; i < n; i++)
++                        row[i] = pk(tw, irow + (P.xb0 + i) * 2);
++                }
++                spi(row, (size_t)n);
++            }
++        } else {
++            const uint8_t *t = P.plane ? t26 : t24;
++            const uint8_t *irow = J.fb + (size_t)y * EPD4G_FB_STRIDE;
++            const uint8_t *mrow = J.mask ? J.mask + (size_t)y * EPD4G_MASK_STRIDE : NULL;
++            for (int xb = 0; xb < EPD4G_MASK_STRIDE; xb++) {
++                const uint8_t *p = irow + xb * 2;
++                uint8_t m = mrow ? mrow[xb] : 0xFF;
++                uint8_t out;
++                if (P.pass == PASS_FULL) out = pk(t, p);
++                else if (m == 0)         out = 0;                              /* keep */
++                else if (P.pass == PASS_1) out = P.plane ? (uint8_t)(m & pk(tbk, p)) : m;
++                else                     out = (uint8_t)(pk(t, p) & m & pk(tgr, p));
++                row[xb] = out;
++            }
++            spi(row, EPD4G_MASK_STRIDE);
+         }
+-        spi(row, EPD4G_MASK_STRIDE);
+     }
+     g_burst_end();
++    return P.y <= P.y1;
+ }
+ 
+-/* Registers common to all passes. border: 0x80 = no border drive (partial), 0x00 = stock. */
++/* Registers common to all 4-gray passes. border: 0x80 = no border drive (partial), 0x00 = stock. */
+ static void send_setup(uint8_t border)
+ {
+     g_cmd(0x3C); g_data(border);
+@@ -285,7 +406,14 @@ static void send_setup(uint8_t border)
+     g_cmd(0x45); g_data(0x00); g_data(0x00); g_data(0x07); g_data(0x01); /* Y: 0..263 */
+ }
+ 
+-/* LUT + RAM cursor to 0,0 (before the planes of every pass) */
++/* RAM cursor to the window start */
++static void send_cursor(int xb, int y)
++{
++    g_cmd(0x4E); g_data((uint8_t)xb);
++    g_cmd(0x4F); g_data((uint8_t)(y & 0xFF)); g_data((uint8_t)((y >> 8) & 0x01));
++}
++
++/* LUT + RAM cursor to 0,0 (before the planes of every 4-gray pass) */
+ static void send_lut_and_cursor(const uint8_t *lut153)
+ {
+     g_cmd(0x32);
+@@ -293,11 +421,18 @@ static void send_lut_and_cursor(const uint8_t *lut153)
+     spi(lut153, 153);
+     g_burst_end();
+ 
+-    g_cmd(0x4E); g_data(0x00);
+-    g_cmd(0x4F); g_data(0x00); g_data(0x00);
++    send_cursor(0, 0);
+ }
+ 
+-/* Common tail of every public call: map a sticky SPI error to a status. */
++/* 1-bit: RAM window registers */
++static void send_window(int xb0, int xb1, int y0, int y1)
++{
++    g_cmd(0x44); g_data((uint8_t)xb0); g_data((uint8_t)xb1);
++    g_cmd(0x45); g_data((uint8_t)(y0 & 0xFF)); g_data((uint8_t)((y0 >> 8) & 0x01));
++                 g_data((uint8_t)(y1 & 0xFF)); g_data((uint8_t)((y1 >> 8) & 0x01));
++}
++
++/* Common tail of a job: map a sticky SPI error to a status. */
+ static int finish(int rc)
+ {
+     if (rc == EPD4G_OK && s_io_err)
+@@ -306,28 +441,19 @@ static int finish(int rc)
+     return rc;
+ }
+ 
+-/* ------------------------------- API ------------------------------------- */
+-int epd4g_init(void)
+-{
+-    int rc;
+-
+-    s_ready = 0;
+-    s_io_err = 0;
+-    tables_init();
++/* ------------------------------- jobs ------------------------------------- */
++/* power off, used before a reset when the analog part was left on */
++#define POWER_OFF_SEQ(where) \
++    do { g_trigger(0x83); WAIT_BUSY(where); s_powered = 0; } while (0)
+ 
+-    /* hardware reset (same timing as the stock library) */
+-    epd4g_port_gpio_cs(1);
+-    epd4g_port_gpio_dc(0);
+-    epd4g_port_gpio_rst(1);
+-    epd4g_port_delay_ms(20);
+-    epd4g_port_gpio_rst(0);
+-    epd4g_port_delay_ms(2);
+-    epd4g_port_gpio_rst(1);
+-    epd4g_port_delay_ms(20);
+-
+-    if ((rc = g_busy("reset")) != EPD4G_OK) return finish(rc);
++static int job_init(void)
++{
++    CR_BEGIN
++    if (s_powered) POWER_OFF_SEQ("pre-init power off");
++    HW_RESET();
++    WAIT_BUSY("reset");
+     g_cmd(0x12);                                  /* soft reset */
+-    if ((rc = g_busy("soft reset")) != EPD4G_OK) return finish(rc);
++    WAIT_BUSY("soft reset");
+ 
+     g_cmd(0x74); g_data(0x54);                    /* analog block control  */
+     g_cmd(0x7E); g_data(0x3B);                    /* digital block control */
+@@ -343,94 +469,382 @@ int epd4g_init(void)
+                  g_data(lut_stock[156]);          /* VSH2 */
+                  g_data(lut_stock[157]);          /* VSL  */
+     g_cmd(0x32);
+-    for (int i = 0; i < 153; i++) g_data(lut_stock[i]);      /* stock 4-gray LUT */
+-    g_cmd(0x4E); g_data(0x00);                    /* RAM cursor 0,0 */
+-    g_cmd(0x4F); g_data(0x00); g_data(0x00);
+-    if ((rc = g_busy("init")) != EPD4G_OK) return finish(rc);
++    g_burst_begin(); spi(lut_stock, 153); g_burst_end();      /* stock 4-gray LUT */
++    send_cursor(0, 0);
++    WAIT_BUSY("init");
+ 
+-    s_ready = 1;
++    s_mode = MODE_GRAY;
+     EPD4G_LOG("[epd4g] init done\r\n");
+-    return finish(EPD4G_OK);
++    CR_END;
+ }
+ 
+-int epd4g_partial(const uint8_t *fb, const uint8_t *mask)
++static int job_full(void)
+ {
+     uint8_t lut[153];
+-    int rc;
++    CR_BEGIN
+     PROF_BEGIN();
++    lut_build_full(lut, (epd4g_full_mode_t)J.fullmode);
++    send_setup(0x00);
++    send_lut_and_cursor(lut);
++    PROF(setup);
++    plane_begin(0, PASS_FULL, 0, EPD4G_HEIGHT - 1, 0, 0);
++    CR_SLICE(plane_step() == 0);
++    plane_begin(1, PASS_FULL, 0, EPD4G_HEIGHT - 1, 0, 0);
++    CR_SLICE(plane_step() == 0);
++    s_data = 0;
++    PROF(spi1);
++    /* 0xC7 = clock+analog on, display, analog+clock off (stock, powers down)
++     * 0xC4 = clock+analog on, display, stay powered                         */
++    g_trigger(EPD4G_KEEP_POWER ? 0xC4 : 0xC7);
++    s_powered = EPD4G_KEEP_POWER;
++    WAIT_BUSY("full refresh");
++    PROF(wait1);
++    CR_END;
++}
+ 
+-    if (fb == NULL || mask == NULL) return EPD4G_ERR_PARAM;
+-    if (!s_ready) return EPD4G_ERR_NOT_INIT;
+-    s_io_err = 0;
+-
++static int job_partial(void)
++{
++    uint8_t lut[153];
++    CR_BEGIN
++    PROF_BEGIN();
++    J.any_gray = mask_has_gray(J.fb, J.mask);
+     lut_build_p1(lut);
+     send_setup(0x80);
+     send_lut_and_cursor(lut);
+     PROF(setup);
+-    send_plane(0, PASS_1, fb, mask);
+-    send_plane(1, PASS_1, fb, mask);
++    plane_begin(0, PASS_1, 0, EPD4G_HEIGHT - 1, 0, 0);
++    CR_SLICE(plane_step() == 0);
++    plane_begin(1, PASS_1, 0, EPD4G_HEIGHT - 1, 0, 0);
++    CR_SLICE(plane_step() == 0);
++    if (!J.any_gray) s_data = 0;
+     PROF(spi1);
+-    if ((rc = g_turn_on("partial pass 1")) != EPD4G_OK) return finish(rc);
++    g_trigger(EPD4G_KEEP_POWER ? 0xC4 : 0xC7);
++    s_powered = EPD4G_KEEP_POWER;
++    WAIT_BUSY("partial pass 1");
+     PROF(wait1);
+ 
+-    lut_build_p2(lut);
+-    send_lut_and_cursor(lut);
+-    send_plane(0, PASS_2, fb, mask);
+-    send_plane(1, PASS_2, fb, mask);
+-    PROF(spi2);
+-    if ((rc = g_turn_on("partial pass 2")) != EPD4G_OK) return finish(rc);
+-    PROF(wait2);
++    if (J.any_gray) {                             /* pass 2 only draws the gray levels */
++        lut_build_p2(lut);
++        send_lut_and_cursor(lut);
++        plane_begin(0, PASS_2, 0, EPD4G_HEIGHT - 1, 0, 0);
++        CR_SLICE(plane_step() == 0);
++        plane_begin(1, PASS_2, 0, EPD4G_HEIGHT - 1, 0, 0);
++        CR_SLICE(plane_step() == 0);
++        s_data = 0;
++        PROF(spi2);
++        g_trigger(EPD4G_KEEP_POWER ? 0xC4 : 0xC7);
++        WAIT_BUSY("partial pass 2");
++        PROF(wait2);
++    }
++    CR_END;
++}
+ 
+-    return finish(EPD4G_OK);
++static int job_power_off(void)
++{
++    CR_BEGIN
++    g_trigger(0x83);                              /* clock on, analog off, clock off */
++    WAIT_BUSY("power off");
++    s_powered = 0;
++    CR_END;
+ }
+ 
+-int epd4g_full(const uint8_t *fb, epd4g_full_mode_t mode)
++static int job_sleep(void)
++{
++    CR_BEGIN
++    if ((s_mode == MODE_GRAY ? EPD4G_KEEP_POWER : EPD4G_BW_KEEP_POWER) || s_powered) {
++        g_trigger(0x83);
++        WAIT_BUSY("power off");
++    }
++    g_cmd(0x10);
++    g_data(0x01);                                 /* deep sleep mode 1; RAM is lost, init to wake */
++    s_powered = 0;
++    if (s_mode == MODE_BW) {
++        s_asleep = 1;                             /* RAM planes stay valid: partial updates can continue */
++    } else {
++        s_mode = MODE_NONE;
++    }
++    CR_END;
++}
++
++/* ---- 1-bit mode: stock EPD_2in7_V2 sequences ---- */
++static int job_bw_init(void)
++{
++    CR_BEGIN
++    if (s_powered) POWER_OFF_SEQ("pre-init power off");
++    HW_RESET();
++    WAIT_BUSY("reset");
++    g_cmd(0x12);                                  /* SWRESET */
++    WAIT_BUSY("soft reset");
++    if (J.bwmode == EPD4G_BW_FAST) {
++        g_cmd(0x18); g_data(0x80);                /* read built-in temperature sensor */
++        g_cmd(0x22); g_data(0xB1);                /* load temperature value */
++        g_cmd(0x20);
++        WAIT_BUSY("temperature");
++        g_cmd(0x1A); g_data(0x64); g_data(0x00);  /* write temperature register */
++    }
++    g_cmd(0x45); g_data(0x00); g_data(0x00); g_data(0x07); g_data(0x01);   /* RAM Y: 0..263 */
++    g_cmd(0x4F); g_data(0x00); g_data(0x00);      /* RAM Y counter 0 */
++    g_cmd(0x11); g_data(0x03);                    /* data entry mode */
++    if (J.bwmode == EPD4G_BW_FAST) {
++        g_cmd(0x22); g_data(0x91);                /* load the waveform for the temperature above */
++        g_cmd(0x20);
++        WAIT_BUSY("fast lut");
++    }
++    s_mode = MODE_BW;
++    s_asleep = 0;
++    s_base = 0;
++    s_win_full = 1;                               /* power-on default of 0x44 is 0..21 bytes */
++    s_border_part = 0;
++    s_fast_lut = (J.bwmode == EPD4G_BW_FAST);
++    CR_END;
++}
++
++static int job_bw_full(void)
++{
++    CR_BEGIN
++    if (!s_win_full) {
++        send_window(0, EPD4G_BW_STRIDE - 1, 0, EPD4G_HEIGHT - 1);
++        s_win_full = 1;
++    }
++    if (s_border_part) {
++        g_cmd(0x3C); g_data(EPD4G_BW_BORDER_FULL);
++        s_border_part = 0;
++    }
++    /* stock Display_Base: the image goes to both planes, so the panel's "old" picture is right */
++    send_cursor(0, 0);
++    plane_begin(0, PASS_BW, 0, EPD4G_HEIGHT - 1, 0, EPD4G_BW_STRIDE - 1);
++    CR_SLICE(plane_step() == 0);
++    send_cursor(0, 0);
++    plane_begin(1, PASS_BW, 0, EPD4G_HEIGHT - 1, 0, EPD4G_BW_STRIDE - 1);
++    CR_SLICE(plane_step() == 0);
++    s_data = 0;
++    /* 0xF7: load temperature + LUT, display mode 1, power down (stock Display / Clear)
++     * 0xC7: stock Display_Fast, uses the LUT loaded by Init_Fast                        */
++    J.ctl = (J.bwmode == EPD4G_BW_FAST) ? 0xC7 : 0xF7;
++    if (EPD4G_BW_KEEP_POWER) J.ctl = (uint8_t)(J.ctl & 0xFC);
++    g_trigger(J.ctl);
++    s_powered = EPD4G_BW_KEEP_POWER;
++    WAIT_BUSY("bw full");
++    s_base = 1;
++    if (J.bwmode != EPD4G_BW_FAST) s_fast_lut = 0;      /* 0xF7 reloaded the normal waveform */
++    CR_END;
++}
++
++static int job_bw_partial(void)
++{
++    CR_BEGIN
++    if (EPD4G_BW_PARTIAL_RESET) {                 /* stock Display_Partial starts with a hardware reset */
++        HW_RESET();                               /* ... which also wakes the panel from deep sleep */
++    }
++    s_asleep = 0;
++    g_cmd(0x3C); g_data(0x80);                    /* border waveform */
++    send_window(J.xb0, J.xb1, J.y0, J.y1);
++    send_cursor(J.xb0, J.y0);
++    plane_begin(0, PASS_BW, J.y0, J.y1, J.xb0, J.xb1);
++    CR_SLICE(plane_step() == 0);
++    s_data = 0;
++    J.ctl = EPD4G_BW_KEEP_POWER ? 0xFC : 0xFF;    /* 0xFF: load LUT, display mode 2, power down */
++    g_trigger(J.ctl);
++    s_powered = EPD4G_BW_KEEP_POWER;
++    s_win_full = (J.xb0 == 0 && J.xb1 == EPD4G_BW_STRIDE - 1 && J.y0 == 0 && J.y1 == EPD4G_HEIGHT - 1);
++    s_border_part = 1;
++    s_fast_lut = 0;                               /* the partial waveform replaced it */
++    WAIT_BUSY("bw partial");
++    CR_END;
++}
++
++/* ------------------------------ scheduler -------------------------------- */
++static int job_run(void)
++{
++    switch (J.kind) {
++    case JOB_INIT:       return job_init();
++    case JOB_FULL:       return job_full();
++    case JOB_PARTIAL:    return job_partial();
++    case JOB_BW_INIT:    return job_bw_init();
++    case JOB_BW_FULL:    return job_bw_full();
++    case JOB_BW_PARTIAL: return job_bw_partial();
++    case JOB_POWER_OFF:  return job_power_off();
++    case JOB_SLEEP:      return job_sleep();
++    default:             return 0;
++    }
++}
++
++int epd4g_poll(void)
+ {
+-    uint8_t lut[153];
+     int rc;
+-    PROF_BEGIN();
+ 
+-    if (fb == NULL) return EPD4G_ERR_PARAM;
+-    if (!s_ready) return EPD4G_ERR_NOT_INIT;
++    if (J.kind == JOB_NONE)
++        return 0;
++    s_waiting = 0;
++    if (job_run() != 0)
++        return EPD4G_PENDING;
++
++    rc = finish(J.rc);
++    s_result = rc;
++    s_data = 0;
++    J.kind = JOB_NONE;
++    J.pc = 0;
++    if (s_cb != NULL)
++        s_cb(rc, s_cb_ctx);
++    return 0;
++}
++
++int epd4g_is_busy(void)            { return J.kind != JOB_NONE; }
++int epd4g_data_busy(void)          { return s_data; }
++int epd4g_result(void)             { return s_result; }
++void epd4g_set_done_cb(epd4g_done_cb_t cb, void *ctx) { s_cb = cb; s_cb_ctx = ctx; }
++
++int epd4g_wait(void)
++{
++    while (epd4g_poll() != 0) {
++        if (s_waiting)
++            epd4g_port_delay_ms(EPD4G_BUSY_POLL_MS);
++    }
++    return s_result;
++}
++
++void epd4g_abort(void)
++{
++    J.kind = JOB_NONE;
++    J.pc = 0;
++    s_mode = MODE_NONE;
++    s_asleep = 0;
++    s_powered = 0;
++    s_data = 0;
+     s_io_err = 0;
++}
+ 
+-    lut_build_full(lut, mode);
+-    send_setup(0x00);
+-    send_lut_and_cursor(lut);
+-    PROF(setup);
+-    send_plane(0, PASS_FULL, fb, NULL);
+-    send_plane(1, PASS_FULL, fb, NULL);
+-    PROF(spi1);
+-    rc = g_turn_on("full refresh");
+-    PROF(wait1);
+-    return finish(rc);
++/* ------------------------------ start API -------------------------------- */
++static int job_start(uint8_t kind)
++{
++    if (J.kind != JOB_NONE)
++        return EPD4G_ERR_BUSY;
++    J.kind = kind;
++    J.pc = 0;
++    J.rc = EPD4G_OK;
++    s_io_err = 0;
++    return EPD4G_OK;
++}
++
++static int need_mode(uint8_t mode)
++{
++    if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
++    if (s_mode != mode)      return EPD4G_ERR_MODE;
++    return EPD4G_OK;
++}
++
++int epd4g_start_init(void)
++{
++    int rc = job_start(JOB_INIT);
++    if (rc != EPD4G_OK) return rc;
++    s_mode = MODE_NONE;
++    s_asleep = 0;
++    tables_init();
++    return EPD4G_OK;
+ }
+ 
+-int epd4g_power_off(void)
++int epd4g_start_full(const uint8_t *fb, epd4g_full_mode_t mode)
+ {
+     int rc;
++    if (fb == NULL) return EPD4G_ERR_PARAM;
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if ((rc = need_mode(MODE_GRAY)) != EPD4G_OK) return rc;
++    job_start(JOB_FULL); s_data = 1;
++    J.fb = fb; J.mask = NULL; J.fullmode = (uint8_t)mode;
++    return EPD4G_OK;
++}
+ 
+-    if (!s_ready) return EPD4G_ERR_NOT_INIT;
+-    s_io_err = 0;
+-    g_cmd(0x22);
+-    g_data(0x83);                                 /* clock on, analog off, clock off */
+-    g_cmd(0x20);
+-    rc = g_busy("power off");
+-    return finish(rc);
++int epd4g_start_partial(const uint8_t *fb, const uint8_t *mask)
++{
++    int rc;
++    if (fb == NULL || mask == NULL) return EPD4G_ERR_PARAM;
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if ((rc = need_mode(MODE_GRAY)) != EPD4G_OK) return rc;
++    job_start(JOB_PARTIAL); s_data = 1;
++    J.fb = fb; J.mask = mask;
++    return EPD4G_OK;
++}
++
++int epd4g_start_power_off(void)
++{
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
++    if (s_asleep) { s_result = EPD4G_OK; return EPD4G_OK; }     /* already off */
++    return job_start(JOB_POWER_OFF);
++}
++
++int epd4g_start_sleep(void)
++{
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
++    if (s_asleep) { s_result = EPD4G_OK; return EPD4G_OK; }     /* already asleep: nothing to do */
++    return job_start(JOB_SLEEP);
++}
++
++int epd4g_start_bw_init(epd4g_bw_mode_t mode)
++{
++    int rc = job_start(JOB_BW_INIT);
++    if (rc != EPD4G_OK) return rc;
++    s_mode = MODE_NONE;
++    tables_init();
++    J.bwmode = (uint8_t)mode;
++    return EPD4G_OK;
++}
++
++int epd4g_start_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode)
++{
++    int rc;
++    if (img == NULL && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
++    if (src != EPD4G_SRC_1BPP && src != EPD4G_SRC_2BPP && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if ((rc = need_mode(MODE_BW)) != EPD4G_OK) return rc;
++    if (s_asleep) return EPD4G_ERR_NOT_INIT;                    /* a full refresh needs epd4g_bw_init() */
++    if (mode == EPD4G_BW_FAST && !s_fast_lut) return EPD4G_ERR_MODE;
++    job_start(JOB_BW_FULL); s_data = (src != EPD4G_SRC_WHITE);
++    J.img = img; J.src = (uint8_t)src; J.bwmode = (uint8_t)mode;
++    return EPD4G_OK;
++}
++
++int epd4g_start_bw_clear(epd4g_bw_mode_t mode)
++{
++    return epd4g_start_bw_full(NULL, EPD4G_SRC_WHITE, mode);
+ }
+ 
+-int epd4g_sleep(void)
++int epd4g_start_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t *rect)
+ {
+-    if (!s_ready) return EPD4G_ERR_NOT_INIT;
+-#if EPD4G_KEEP_POWER
+-    {
+-        int rc = epd4g_power_off();
+-        if (rc != EPD4G_OK) return rc;
++    int rc, x0 = 0, y0 = 0, x1 = EPD4G_WIDTH - 1, y1 = EPD4G_HEIGHT - 1;
++    if (img == NULL && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
++    if (src != EPD4G_SRC_1BPP && src != EPD4G_SRC_2BPP && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
++    if (rect != NULL) {
++        x0 = rect->x0; y0 = rect->y0; x1 = rect->x1; y1 = rect->y1;
++        if (x0 < 0) x0 = 0;
++        if (y0 < 0) y0 = 0;
++        if (x1 >= EPD4G_WIDTH)  x1 = EPD4G_WIDTH - 1;
++        if (y1 >= EPD4G_HEIGHT) y1 = EPD4G_HEIGHT - 1;
++        if (x0 > x1 || y0 > y1) return EPD4G_ERR_PARAM;
+     }
+-#endif
+-    s_io_err = 0;
+-    g_cmd(0x10);
+-    g_data(0x01);                                 /* deep sleep mode 1; RAM is lost, init to wake */
+-    s_ready = 0;
+-    return finish(EPD4G_OK);
++    if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
++    if ((rc = need_mode(MODE_BW)) != EPD4G_OK) return rc;
++    if (s_asleep && !EPD4G_BW_PARTIAL_RESET) return EPD4G_ERR_NOT_INIT;   /* no reset -> nothing wakes the panel */
++    if (!s_base) return EPD4G_ERR_NO_BASE;
++    job_start(JOB_BW_PARTIAL); s_data = (src != EPD4G_SRC_WHITE);
++    J.img = img; J.src = (uint8_t)src;
++    J.xb0 = x0 >> 3; J.xb1 = x1 >> 3; J.y0 = y0; J.y1 = y1;
++    return EPD4G_OK;
+ }
++
++/* ------------------------------ blocking API ----------------------------- */
++static int blocking(int rc)
++{
++    return rc != EPD4G_OK ? rc : epd4g_wait();
++}
++
++int epd4g_init(void)                                 { return blocking(epd4g_start_init()); }
++int epd4g_full(const uint8_t *fb, epd4g_full_mode_t m) { return blocking(epd4g_start_full(fb, m)); }
++int epd4g_partial(const uint8_t *fb, const uint8_t *mask) { return blocking(epd4g_start_partial(fb, mask)); }
++int epd4g_power_off(void)                            { return blocking(epd4g_start_power_off()); }
++int epd4g_sleep(void)                                { return blocking(epd4g_start_sleep()); }
++int epd4g_bw_init(epd4g_bw_mode_t m)                 { return blocking(epd4g_start_bw_init(m)); }
++int epd4g_bw_full(const void *img, epd4g_src_t s, epd4g_bw_mode_t m) { return blocking(epd4g_start_bw_full(img, s, m)); }
++int epd4g_bw_clear(epd4g_bw_mode_t m)                { return blocking(epd4g_start_bw_clear(m)); }
++int epd4g_bw_partial(const void *img, epd4g_src_t s, const epd4g_rect_t *r) { return blocking(epd4g_start_bw_partial(img, s, r)); }
+diff --git a/epd4g/src/epd4g_fb.c b/epd4g/src/epd4g_fb.c
+index 41c30e9..123633c 100644
+--- a/epd4g/src/epd4g_fb.c
++++ b/epd4g/src/epd4g_fb.c
+@@ -163,33 +163,116 @@ uint32_t epd4g_mask_from_diff(uint8_t *mask, const uint8_t *prev, const uint8_t
+ }
+ 
+ #if EPD4G_INTERNAL_MASK
+-/* One scratch mask shared by epd4g_partial_diff() and epd4g_partial_rect(). */
++/* One scratch mask shared by the partial_diff / partial_rect helpers. A running job reads it, so the
++ * start functions refuse (EPD4G_ERR_BUSY) while a job is in progress. */
+ static uint8_t s_mask[EPD4G_MASK_BYTES];
+ 
+-int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
+-                       const epd4g_rect_t *roi, uint32_t *changed)
++int epd4g_start_partial_diff(const uint8_t *prev, const uint8_t *cur,
++                             const epd4g_rect_t *roi, uint32_t *changed)
+ {
+     uint32_t n;
+ 
+     if (prev == NULL || cur == NULL)
+         return EPD4G_ERR_PARAM;
++    if (epd4g_is_busy())
++        return EPD4G_ERR_BUSY;
+     n = epd4g_mask_from_diff(s_mask, prev, cur, roi);
+     if (changed != NULL)
+         *changed = n;
+     if (n == 0)
+         return EPD4G_OK;
+-    return epd4g_partial(cur, s_mask);
++    return epd4g_start_partial(cur, s_mask);
+ }
+ 
+-int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
++int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
+ {
+     if (fb == NULL || rect == NULL)
+         return EPD4G_ERR_PARAM;
+     if (rect->x0 > rect->x1 || rect->y0 > rect->y1 ||
+         rect->x1 < 0 || rect->y1 < 0 || rect->x0 >= EPD4G_WIDTH || rect->y0 >= EPD4G_HEIGHT)
+         return EPD4G_ERR_PARAM;
++    if (epd4g_is_busy())
++        return EPD4G_ERR_BUSY;
+     epd4g_mask_clear(s_mask);
+     epd4g_mask_set_rect(s_mask, rect);
+-    return epd4g_partial(fb, s_mask);
++    return epd4g_start_partial(fb, s_mask);
++}
++
++int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
++                       const epd4g_rect_t *roi, uint32_t *changed)
++{
++    int rc = epd4g_start_partial_diff(prev, cur, roi, changed);
++    if (rc != EPD4G_OK || !epd4g_is_busy())
++        return rc;                                  /* error, or nothing changed */
++    return epd4g_wait();
++}
++
++int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
++{
++    int rc = epd4g_start_partial_rect(fb, rect);
++    return rc != EPD4G_OK ? rc : epd4g_wait();
+ }
+ #endif
++
++/* ------------------------------ 1-bit frame ------------------------------- */
++void epd4g_bw_fb_fill(uint8_t *fb, int white)
++{
++    memset(fb, white ? 0xFF : 0x00, EPD4G_BW_FB_BYTES);
++}
++
++void epd4g_bw_fb_set(uint8_t *fb, int x, int y, int white)
++{
++    if (x < 0 || y < 0 || x >= EPD4G_WIDTH || y >= EPD4G_HEIGHT)
++        return;
++    size_t i = (size_t)y * EPD4G_BW_STRIDE + (size_t)(x >> 3);
++    uint8_t m = (uint8_t)(0x80u >> (x & 7));
++    if (white) fb[i] |= m; else fb[i] &= (uint8_t)~m;
++}
++
++int epd4g_bw_fb_get(const uint8_t *fb, int x, int y)
++{
++    if (x < 0 || y < 0 || x >= EPD4G_WIDTH || y >= EPD4G_HEIGHT)
++        return EPD4G_BW_WHITE;
++    return (fb[(size_t)y * EPD4G_BW_STRIDE + (size_t)(x >> 3)] >> (7 - (x & 7))) & 1;
++}
++
++void epd4g_bw_fb_set_rot(uint8_t *fb, epd4g_rot_t rot, int x, int y, int white)
++{
++    int nx, ny;
++    if (epd4g_map(rot, x, y, &nx, &ny) == 0)
++        epd4g_bw_fb_set(fb, nx, ny, white);
++}
++
++int epd4g_bw_fb_get_rot(const uint8_t *fb, epd4g_rot_t rot, int x, int y)
++{
++    int nx, ny;
++    if (epd4g_map(rot, x, y, &nx, &ny) != 0)
++        return EPD4G_BW_WHITE;
++    return epd4g_bw_fb_get(fb, nx, ny);
++}
++
++void epd4g_bw_fb_copy_rect(uint8_t *dst, const uint8_t *src, const epd4g_rect_t *r)
++{
++    int x0 = r->x0 < 0 ? 0 : r->x0, x1 = r->x1 >= EPD4G_WIDTH ? EPD4G_WIDTH - 1 : r->x1;
++    int y0 = r->y0 < 0 ? 0 : r->y0, y1 = r->y1 >= EPD4G_HEIGHT ? EPD4G_HEIGHT - 1 : r->y1;
++    if (x0 > x1 || y0 > y1)
++        return;
++    for (int y = y0; y <= y1; y++) {
++        size_t o = (size_t)y * EPD4G_BW_STRIDE + (size_t)(x0 >> 3);
++        memcpy(&dst[o], &src[o], (size_t)((x1 >> 3) - (x0 >> 3) + 1));
++    }
++}
++
++void epd4g_fb_to_bw(uint8_t *bw, const uint8_t *fb)
++{
++    for (int y = 0; y < EPD4G_HEIGHT; y++)
++        for (int xb = 0; xb < EPD4G_BW_STRIDE; xb++) {
++            uint8_t v = 0;
++            for (int k = 0; k < 8; k++) {
++                int x = xb * 8 + k;
++                if (epd4g_fb_get(fb, x, y) >= EPD4G_BW_THRESHOLD)
++                    v |= (uint8_t)(0x80u >> k);
++            }
++            bw[(size_t)y * EPD4G_BW_STRIDE + (size_t)xb] = v;
++        }
++}
+diff --git a/epd4g/tests/Makefile b/epd4g/tests/Makefile
+index 45d58b4..ba30b75 100644
+--- a/epd4g/tests/Makefile
++++ b/epd4g/tests/Makefile
+@@ -14,7 +14,9 @@ t_default: $(SRC) golden.inc ../include/*.h
+ # the same tests with other configurations
+ variants:
+ 	@set -e; for d in "-DEPD4G_KEEP_POWER=0" "-DEPD4G_FULL_SHAKE_RP=1" "-DEPD4G_FULL_SHAKE_RP=3" \
+-	  "-DEPD4G_T_BLACK=30 -DEPD4G_T_WHITE=50" "-DEPD4G_T_LIGHT=5 -DEPD4G_T_DARK=12" "-DEPD4G_PROFILE" "-DEPD4G_INTERNAL_MASK=1"; do \
++	  "-DEPD4G_T_BLACK=30 -DEPD4G_T_WHITE=50" "-DEPD4G_T_LIGHT=5 -DEPD4G_T_DARK=12" "-DEPD4G_PROFILE" "-DEPD4G_INTERNAL_MASK=1" \
++	  "-DEPD4G_ROWS_PER_POLL=1" "-DEPD4G_ROWS_PER_POLL=64" "-DEPD4G_BW_THRESHOLD=1" "-DEPD4G_BW_THRESHOLD=3" \
++	  "-DEPD4G_BW_KEEP_POWER=1 -DEPD4G_BW_PARTIAL_RESET=0" "-DEPD4G_BW_PARTIAL_RESET=0" "-DEPD4G_KEEP_POWER=0 -DEPD4G_BUSY_SETTLE_MS=0"; do \
+ 	  echo "== $$d"; $(CC) $(CFLAGS) $(INC) $$d $(SRC) -o t_variant && ./t_variant; done
+ 
+ # regenerate golden.inc from the stock Waveshare library: make golden WS=/path/to/e-Paper/STM32/STM32-F103ZET6/User/e-Paper
+diff --git a/epd4g/tests/golden.inc b/epd4g/tests/golden.inc
+index 889cf7c..1ddbf9f 100644
+--- a/epd4g/tests/golden.inc
++++ b/epd4g/tests/golden.inc
+@@ -23,4 +23,14 @@ static const uint16_t golden_init[] = {
+ #define GOLDEN_PLANE24_FNV 0xAD8192B0u
+ #define GOLDEN_PLANE26_LEN 5808
+ #define GOLDEN_PLANE26_FNV 0x0DF25AB8u
++#define GOLDEN_BW_SEED 777u
++static const uint16_t golden_bw_init[] = { 0x012, 0x045, 0x100, 0x100, 0x107, 0x101, 0x04F, 0x100, 0x100, 0x011, 0x103, };
++static const uint16_t golden_bw_init_fast[] = { 0x012, 0x018, 0x180, 0x022, 0x1B1, 0x020, 0x01A, 0x164, 0x100, 0x045, 0x100, 0x100, 0x107, 0x101, 0x04F, 0x100, 0x100, 0x011, 0x103, 0x022, 0x191, 0x020, };
++#define GOLDEN_BWBASE_P24_FNV 0xF38333F3u
++#define GOLDEN_BWBASE_P26_FNV 0xF38333F3u
++#define GOLDEN_BWBASE_LEN 5808
++#define GOLDEN_BWFAST_P24_FNV 0xF38333F3u
++#define GOLDEN_BWCLEAR_P24_FNV 0x3D2B6BD5u
++#define GOLDEN_BWPART_LEN 559
++#define GOLDEN_BWPART_FNV 0xB2CB34B8u
+ static const uint16_t golden_sleep[] = { 0x010, 0x101, };
+diff --git a/epd4g/tests/test_epd4g.c b/epd4g/tests/test_epd4g.c
+index 3870737..71ab1da 100644
+--- a/epd4g/tests/test_epd4g.c
++++ b/epd4g/tests/test_epd4g.c
+@@ -8,6 +8,11 @@
+  *    partial update each pixel shows exactly its target gray and untouched pixels do not move;
+  *  - waveform lengths, power commands, error handling, frame buffer / rotation / mask helpers.
+  *
++ * The 1-bit mode is checked against the stock Init / Init_Fast / Display_Base / Display_Fast /
++ * Clear / Display_Partial / Sleep streams and with a model of the controller RAM (window, cursor, old/new
++ * planes). The non-blocking interface is checked for bounded work per poll() call and for the same
++ * results as the blocking one.
++ *
+  * Model assumption (cannot be seen from the host, verified visually on hardware): RAM pair
+  * (0x24,0x26) selects LUT row (0,0)=0 (0,1)=1 (1,0)=2 (1,1)=3.
+  */
+@@ -16,6 +21,7 @@
+ #include <string.h>
+ #include "epd4g.h"
+ #include "epd4g_fb.h"
++#include "epd4g_bw.h"
+ #include "epd4g_port.h"
+ #include "golden.inc"
+ 
+@@ -33,6 +39,14 @@ static int      rst_log[8], rst_n;
+ static uint32_t now_ms;
+ static int      busy_stuck, spi_fail, spi_calls;
+ static int      ctrl_c4, ctrl_c7, ctrl_other;
++static uint32_t busy_until;              /* BUSY is high until this time (set by every 0x20) */
++static long     spi_bytes;               /* data + command bytes sent in total */
++
++/* 1-bit controller model: RAM window + cursor, old/new planes (1 = white), what the glass shows */
++static int      sim_bw;
++static uint8_t  bwn[EPD4G_BW_FB_BYTES], bwo[EPD4G_BW_FB_BYTES], bwshow[EPD4G_BW_FB_BYTES];
++static int      wx0, wx1 = 21, wy0, wy1 = 263, cx, cy, nargs, args[8];
++static int      bw_full_updates, bw_part_updates;
+ 
+ /* ink model state */
+ static int      dark[NAT_W * NAT_H];
+@@ -46,10 +60,14 @@ static int      errors;
+ 
+ #define CHECK(cond, ...) do { if (!(cond)) { errors++; if (errors < 20) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } } while (0)
+ 
+-void epd4g_port_gpio_rst(int l) { if (rst_n < 8) rst_log[rst_n++] = l; }
++void epd4g_port_gpio_rst(int l)
++{
++    if (rst_n < 8) rst_log[rst_n++] = l;
++    if (l == 0) { wx0 = 0; wx1 = 21; wy0 = 0; wy1 = 263; cx = cy = 0; }      /* controller defaults */
++}
+ void epd4g_port_gpio_dc(int l)  { dc = l; }
+ void epd4g_port_gpio_cs(int l)  { cs = l; }
+-int  epd4g_port_gpio_busy(void) { return busy_stuck; }
++int  epd4g_port_gpio_busy(void) { return busy_stuck || now_ms < busy_until; }
+ void epd4g_port_delay_ms(uint32_t ms) { now_ms += ms; }
+ uint32_t epd4g_port_tick_ms(void) { return now_ms; }
+ 
+@@ -78,8 +96,38 @@ static int run_lut(int row, int d)
+     return d;
+ }
+ 
++static void bw_ram_write(int plane, uint8_t v)
++{
++    uint8_t *ram = plane ? bwo : bwn;
++    if (cx >= 0 && cx < 22 && cy >= 0 && cy < 264) ram[cy * 22 + cx] = v;
++    if (++cx > wx1) { cx = wx0; if (++cy > wy1) cy = wy0; }
++}
++
++static void bw_reg_arg(int cmd, int v)
++{
++    args[nargs < 8 ? nargs : 7] = v; nargs++;
++    if (cmd == 0x44 && nargs == 2) { wx0 = args[0]; wx1 = args[1]; }
++    if (cmd == 0x45 && nargs == 4) { wy0 = args[0] | (args[1] << 8); wy1 = args[2] | (args[3] << 8); }
++    if (cmd == 0x4E && nargs == 1) cx = args[0];
++    if (cmd == 0x4F && nargs == 2) cy = args[0] | (args[1] << 8);
++}
++
++static void bw_update(void)
++{
++    if (last_ctrl & 0x08) { /* display mode 2: only pixels whose new and old RAM differ are driven */
++        for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) bwshow[i] = (uint8_t)((bwshow[i] & ~(bwn[i] ^ bwo[i])) | (bwn[i] & (bwn[i] ^ bwo[i])));
++        bw_part_updates++;
++    } else {                /* mode 1: the whole panel shows the new RAM */
++        memcpy(bwshow, bwn, sizeof bwshow);
++        bw_full_updates++;
++    }
++    memcpy(bwo, bwn, sizeof bwo);
++    updates_seen++;
++}
++
+ static void display_update(void)
+ {
++    if (sim_bw) { bw_update(); return; }
+     updates_seen++;
+     CHECK(lutn == 153, "LUT length %d", lutn);
+     CHECK(n24 == EPD4G_MASK_BYTES && n26 == EPD4G_MASK_BYTES, "plane sizes %d %d", n24, n26);
+@@ -120,14 +168,19 @@ int epd4g_port_spi_write(const uint8_t *d, size_t n)
+     for (size_t k = 0; k < n; k++) {
+         uint8_t v = d[k];
+         if (stream_n < 8192) stream[stream_n++] = (uint16_t)(v | (dc ? 0x100 : 0));
++        spi_bytes++;
+         if (!dc) {
+-            cur_cmd = v;
++            cur_cmd = v; nargs = 0;
+             if (v == 0x24) n24 = 0;
+             if (v == 0x26) n26 = 0;
+             if (v == 0x32) lutn = 0;
+-            if (v == 0x20) display_update();
+-        } else if (cur_cmd == 0x24 && n24 < EPD4G_MASK_BYTES) p24[n24++] = v;
+-        else if (cur_cmd == 0x26 && n26 < EPD4G_MASK_BYTES) p26[n26++] = v;
++            if (v == 0x20) {
++                busy_until = now_ms + (sim_bw ? ((last_ctrl & 0x08) ? 300u : 1500u) : (uint32_t)lut_frames() * 20u);
++                display_update();
++            }
++        } else if (cur_cmd == 0x24 && n24 < EPD4G_MASK_BYTES) { p24[n24++] = v; if (sim_bw) bw_ram_write(0, v); }
++        else if (cur_cmd == 0x26 && n26 < EPD4G_MASK_BYTES) { p26[n26++] = v; if (sim_bw) bw_ram_write(1, v); }
++        else if (sim_bw && (cur_cmd == 0x44 || cur_cmd == 0x45 || cur_cmd == 0x4E || cur_cmd == 0x4F)) bw_reg_arg(cur_cmd, v);
+         else if (cur_cmd == 0x32 && lutn < 400) lutb[lutn++] = v;
+         else if (cur_cmd == 0x22) last_ctrl = v;
+     }
+@@ -366,6 +419,373 @@ static void test_fb_helpers(void)
+     CHECK(cnt == 12, "mask_set_rect set %u bits", cnt);
+ }
+ 
++
++/* ============================ 1-bit mode ================================== */
++static void bw_random(uint8_t *img) { for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) img[i] = (uint8_t)rnd(); }
++
++__attribute__((unused)) static uint32_t stream_fnv(int from)
++{
++    uint32_t h = 2166136261u;
++    for (int i = from; i < stream_n; i++) { h ^= stream[i] & 0xFF; h *= 16777619u; h ^= stream[i] >> 8; h *= 16777619u; }
++    return h;
++}
++
++static void check_bw_shows(const uint8_t *img, const char *what)
++{
++    for (int i = 0; i < EPD4G_BW_FB_BYTES; i++)
++        if (bwshow[i] != img[i]) { CHECK(0, "%s: panel shows %02X, expected %02X at byte %d (x=%d y=%d)", what, bwshow[i], img[i], i, (i % 22) * 8, i / 22); return; }
++}
++
++static void test_bw_init_and_full_match_stock(void)
++{
++    static uint8_t img[EPD4G_BW_FB_BYTES];
++    sim_bw = 1;
++    epd4g_power_off();                       /* a previous 4-gray test may have left the analog part on */
++    rng = GOLDEN_BW_SEED;
++    for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) img[i] = (uint8_t)rnd();     /* same generator as gen_golden.c */
++
++    for (int fast = 0; fast < 2; fast++) {
++        const uint16_t *g = fast ? golden_bw_init_fast : golden_bw_init;
++        const int ng = fast ? (int)(sizeof golden_bw_init_fast / sizeof golden_bw_init_fast[0]) : (int)(sizeof golden_bw_init / sizeof golden_bw_init[0]);
++        epd4g_power_off();                   /* the library would do it itself; keep the stream comparable */
++        clear_stream(); rst_n = 0;
++        CHECK(epd4g_bw_init(fast ? EPD4G_BW_FAST : EPD4G_BW_NORMAL) == EPD4G_OK, "bw init");
++        CHECK(stream_n == ng, "bw init (fast=%d) stream length %d, stock %d", fast, stream_n, ng);
++        for (int i = 0; i < ng && i < stream_n; i++)
++            if (stream[i] != g[i]) { CHECK(0, "bw init (fast=%d) differs from stock at %d: %03X vs %03X", fast, i, stream[i], g[i]); break; }
++        CHECK(rst_n == 3 && rst_log[0] == 1 && rst_log[1] == 0 && rst_log[2] == 1, "bw reset pulse");
++
++        clear_stream(); bw_full_updates = 0;
++        CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, fast ? EPD4G_BW_FAST : EPD4G_BW_NORMAL) == EPD4G_OK, "bw full");
++        CHECK(n24 == GOLDEN_BWBASE_LEN && n26 == GOLDEN_BWBASE_LEN, "bw plane sizes %d %d", n24, n26);
++        CHECK(fnv(p24, n24) == (fast ? GOLDEN_BWFAST_P24_FNV : GOLDEN_BWBASE_P24_FNV), "bw RAM 0x24 differs from stock (fast=%d)", fast);
++        CHECK(fnv(p26, n26) == GOLDEN_BWBASE_P26_FNV, "bw RAM 0x26 differs from stock Display_Base");
++#if !EPD4G_BW_KEEP_POWER
++        CHECK(last_ctrl == (fast ? 0xC7 : 0xF7), "bw full control byte %02X", last_ctrl);
++#endif
++        CHECK(bw_full_updates == 1, "one full update");
++        check_bw_shows(img, "bw full");
++    }
++
++    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "bw init");
++    CHECK(epd4g_bw_clear(EPD4G_BW_NORMAL) == EPD4G_OK, "bw clear");
++    CHECK(fnv(p24, n24) == GOLDEN_BWCLEAR_P24_FNV, "bw clear plane differs from stock Clear");
++    for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) if (bwshow[i] != 0xFF) { CHECK(0, "clear is not white"); break; }
++
++    /* 4-gray frame as the source: converted while sending */
++    static uint8_t g4[EPD4G_FB_BYTES], ref[EPD4G_BW_FB_BYTES], ref2[EPD4G_BW_FB_BYTES];
++    random_fb(g4);
++    epd4g_fb_to_bw(ref, g4);
++    for (int y = 0; y < NAT_H; y++) for (int x = 0; x < NAT_W; x++)
++        epd4g_bw_fb_set(ref2, x, y, epd4g_fb_get(g4, x, y) >= EPD4G_BW_THRESHOLD);
++    CHECK(memcmp(ref, ref2, sizeof ref) == 0, "fb_to_bw vs per-pixel threshold");
++    CHECK(epd4g_bw_full(g4, EPD4G_SRC_2BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "bw full from 2bpp");
++    check_bw_shows(ref, "bw full 2bpp");
++    sim_bw = 0;
++}
++
++static void test_bw_partial(void)
++{
++    static uint8_t shown[EPD4G_BW_FB_BYTES], img[EPD4G_BW_FB_BYTES], g4[EPD4G_FB_BYTES], conv[EPD4G_BW_FB_BYTES], want[EPD4G_BW_FB_BYTES];
++    sim_bw = 1;
++    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "bw init");
++    bw_random(shown);
++    CHECK(epd4g_bw_full(shown, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "bw full");
++
++    /* the stock Display_Partial stream, byte for byte (window x 16..87, y 40..99) */
++    rng = GOLDEN_BW_SEED;
++    for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) img[i] = (uint8_t)rnd();
++    epd4g_rect_t r0 = { 16, 40, 87, 99 };
++    clear_stream(); rst_n = 0; bw_part_updates = 0;
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r0) == EPD4G_OK, "bw partial");
++#if EPD4G_BW_PARTIAL_RESET && !EPD4G_BW_KEEP_POWER
++    CHECK(stream_n == GOLDEN_BWPART_LEN && stream_fnv(0) == GOLDEN_BWPART_FNV, "partial stream differs from stock Display_Partial (len %d, fnv %08X)", stream_n, stream_fnv(0));
++    CHECK(rst_n == 3 && rst_log[0] == 1 && rst_log[1] == 0 && rst_log[2] == 1, "partial starts with a hardware reset like the stock one");
++#endif
++    CHECK(bw_part_updates == 1, "one partial update");
++    memcpy(want, shown, sizeof want);
++    for (int y = 40; y <= 99; y++) memcpy(&want[y * 22 + 2], &img[y * 22 + 2], 9);
++    check_bw_shows(want, "bw partial window");
++    memcpy(shown, want, sizeof shown);
++
++    /* random windows (unaligned x), both source formats. Only the window changes, the rest of
++     * the passed image is ignored, so it may differ from what is on the panel. */
++    for (int it = 0; it < 60; it++) {
++        epd4g_rect_t r;
++        r.x0 = (int)(rnd() % 176); r.x1 = r.x0 + (int)(rnd() % (176 - r.x0));
++        r.y0 = (int)(rnd() % 264); r.y1 = r.y0 + (int)(rnd() % (264 - r.y0));
++        int use2 = it & 1;
++        if (use2) { random_fb(g4); epd4g_fb_to_bw(conv, g4); memcpy(img, conv, sizeof img); }
++        else bw_random(img);
++        CHECK(epd4g_bw_partial(use2 ? (const void *)g4 : (const void *)img, use2 ? EPD4G_SRC_2BPP : EPD4G_SRC_1BPP, &r) == EPD4G_OK, "bw partial random");
++        memcpy(want, shown, sizeof want);
++        for (int y = r.y0; y <= r.y1; y++) memcpy(&want[y * 22 + (r.x0 >> 3)], &img[y * 22 + (r.x0 >> 3)], (size_t)((r.x1 >> 3) - (r.x0 >> 3) + 1));
++        check_bw_shows(want, "bw partial random");
++        memcpy(shown, want, sizeof shown);
++    }
++
++    /* whole-screen partial (rect == NULL), then a full refresh after partials restores the window */
++    bw_random(img);
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, NULL) == EPD4G_OK, "bw partial whole screen");
++    check_bw_shows(img, "bw partial whole screen");
++    epd4g_rect_t small = { 8, 8, 20, 20 };
++    CHECK(epd4g_bw_partial(shown, EPD4G_SRC_1BPP, &small) == EPD4G_OK, "partial");
++    bw_random(img);
++    int fulls = bw_full_updates;
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "full after partials");
++    CHECK(bw_full_updates == fulls + 1, "full update ran");
++    check_bw_shows(img, "bw full after partials (window registers restored)");
++
++    /* white source and the status codes */
++    CHECK(epd4g_bw_partial(NULL, EPD4G_SRC_WHITE, &small) == EPD4G_OK, "white partial");
++    CHECK(epd4g_bw_partial(NULL, EPD4G_SRC_1BPP, &small) == EPD4G_ERR_PARAM, "NULL image");
++    epd4g_rect_t empty = { 10, 10, 5, 5 }, outside = { 200, 0, 220, 10 };
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &empty) == EPD4G_ERR_PARAM, "empty rect");
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &outside) == EPD4G_ERR_PARAM, "rect outside the panel");
++    sim_bw = 0;
++}
++
++static void test_bw_modes_and_errors(void)
++{
++    static uint8_t img[EPD4G_BW_FB_BYTES], g4[EPD4G_FB_BYTES], mask[EPD4G_MASK_BYTES];
++    epd4g_rect_t r = { 0, 0, 20, 20 };
++    sim_bw = 1; epd4g_fb_fill(g4, EPD4G_WHITE); bw_random(img); epd4g_mask_clear(mask);
++
++    CHECK(epd4g_bw_init(EPD4G_BW_FAST) == EPD4G_OK, "bw init fast");
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_ERR_NO_BASE, "partial without a base picture");
++    CHECK(epd4g_full(g4, EPD4G_FULL_FAST) == EPD4G_ERR_MODE, "4-gray full in 1-bit mode");
++    CHECK(epd4g_partial(g4, mask) == EPD4G_ERR_MODE, "4-gray partial in 1-bit mode");
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_FAST) == EPD4G_OK, "fast full after fast init");
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "partial");
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_FAST) == EPD4G_ERR_MODE, "fast full after a partial needs init_fast again");
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "normal full after a partial");
++
++    sim_bw = 0; clear_stream();
++    CHECK(epd4g_init() == EPD4G_OK, "switch to 4 gray");
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_ERR_MODE, "bw full in 4-gray mode");
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_ERR_MODE, "bw partial in 4-gray mode");
++    CHECK(epd4g_full(g4, EPD4G_FULL_FAST) == EPD4G_OK, "4-gray full after the switch");
++
++    /* switching away while the analog part is left powered: the library powers it down first */
++    sim_bw = 1; clear_stream();
++    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "back to 1 bit");
++#if EPD4G_KEEP_POWER
++    CHECK(stream_n >= 3 && stream[0] == 0x022 && stream[1] == 0x183 && stream[2] == 0x020, "power-off before the reset");
++#endif
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_ERR_NO_BASE, "the 1-bit base is gone after a mode switch");
++
++    /* sleep / wake from the 1-bit mode */
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "full");
++    clear_stream();
++    CHECK(epd4g_sleep() == EPD4G_OK, "bw sleep");
++    const int ns = (int)(sizeof golden_sleep / sizeof golden_sleep[0]);
++    CHECK(stream_n >= ns && stream[stream_n - 2] == golden_sleep[0] && stream[stream_n - 1] == golden_sleep[1], "bw sleep tail differs from the stock Sleep()");
++#if !EPD4G_BW_KEEP_POWER
++    CHECK(stream_n == ns, "stock Sleep() is the whole sequence (the panel powers itself down after an update)");
++#endif
++    CHECK(epd4g_sleep() == EPD4G_OK && epd4g_power_off() == EPD4G_OK, "sleeping twice is harmless");
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_ERR_NOT_INIT, "full refresh after sleep needs init");
++#if EPD4G_BW_PARTIAL_RESET
++    /* stock flow Display_Base, Sleep, Display_Partial: the RAM planes survive and the reset wakes the panel */
++    static uint8_t w2[EPD4G_BW_FB_BYTES];
++    memcpy(w2, img, sizeof w2);
++    for (int y = r.y0; y <= r.y1; y++) memset(&w2[y * 22], (y & 1) ? 0x00 : 0xA5, 3);
++    clear_stream(); rst_n = 0;
++    CHECK(epd4g_bw_partial(w2, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "partial after sleep");
++    CHECK(rst_n == 3, "partial after sleep starts with the reset pulse");
++    for (int y = r.y0; y <= r.y1; y++) memcpy(&img[y * 22], &w2[y * 22], 3);
++    check_bw_shows(img, "partial after sleep");
++    CHECK(epd4g_sleep() == EPD4G_OK, "sleep again");
++#else
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_ERR_NOT_INIT, "no reset in partial: nothing wakes the panel");
++#endif
++    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "wake");
++
++    /* BUSY timeout in the 1-bit mode */
++    busy_stuck = 1;
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_ERR_TIMEOUT, "stuck BUSY");
++    busy_stuck = 0;
++    CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_ERR_NOT_INIT, "after a timeout re-init is required");
++    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "re-init");
++    spi_fail = 1;
++    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_ERR_IO, "SPI error is reported");
++    spi_fail = 0;
++}
++
++/* gray partial with black/white pixels only: pass 2 is skipped */
++static void test_gray_skip_pass2(void)
++{
++    static uint8_t shown[EPD4G_FB_BYTES], next[EPD4G_FB_BYTES], mask[EPD4G_MASK_BYTES];
++    sim_bw = 0; random_fb(shown);
++    CHECK(epd4g_init() == EPD4G_OK, "init");
++    mode_partial = 0;
++    CHECK(epd4g_full(shown, EPD4G_FULL_DEEP) == EPD4G_OK, "full");
++    memcpy(next, shown, sizeof next); epd4g_mask_clear(mask);
++    for (int y = 30; y < 60; y++) for (int x = 20; x < 90; x++) { epd4g_mask_set(mask, x, y); epd4g_fb_set(next, x, y, ((x + y) & 1) ? EPD4G_BLACK : EPD4G_WHITE); }
++    mode_partial = 1; pass_no = 0; expect_fb = next;
++    int before = updates_seen;
++    CHECK(epd4g_partial(next, mask) == EPD4G_OK, "partial");
++    mode_partial = 0;
++    CHECK(updates_seen == before + 1, "black/white only: %d panel updates, expected 1", updates_seen - before);
++    check_ink_equals(next, "partial without gray");
++    pass_no = 0;
++    /* one gray pixel brings pass 2 back */
++    epd4g_mask_set(mask, 100, 100); epd4g_fb_set(next, 100, 100, EPD4G_LIGHT);
++    mode_partial = 1; pass_no = 0; expect_fb = next; before = updates_seen;
++    CHECK(epd4g_partial(next, mask) == EPD4G_OK, "partial");
++    mode_partial = 0;
++    CHECK(updates_seen == before + 2, "with a gray pixel: %d panel updates, expected 2", updates_seen - before);
++    check_ink_equals(next, "partial with gray");
++}
++
++/* ======================= non-blocking interface =========================== */
++static int cb_calls, cb_rc;
++static void done_cb(int rc, void *ctx) { cb_calls++; cb_rc = rc; (void)ctx; }
++
++/* run a job with poll(): the "main loop" does other work and time passes by itself. Returns the
++ * largest number of SPI bytes sent by one poll call. */
++static long run_async(long *loops, int *max_pending_ms)
++{
++    long worst = 0, n = 0;
++    uint32_t t_start = now_ms;
++    while (epd4g_is_busy()) {
++        long b0 = spi_bytes;
++        uint32_t t0 = now_ms;
++        int pending = epd4g_poll();
++        CHECK(now_ms == t0, "poll() must not sleep or advance time itself");
++        if (spi_bytes - b0 > worst) worst = spi_bytes - b0;
++        CHECK(pending == 0 || pending == EPD4G_PENDING, "poll status");
++        n++;                                    /* the rest of the main loop: GNSS, buttons, ... */
++        now_ms += 1;                            /* 1 ms per main loop pass */
++        CHECK(now_ms - t_start < 60000, "job does not finish");
++        if (now_ms - t_start >= 60000) break;
++    }
++    if (loops) *loops = n;
++    if (max_pending_ms) *max_pending_ms = (int)(now_ms - t_start);
++    return worst;
++}
++
++static void test_async(void)
++{
++    static uint8_t fb[EPD4G_FB_BYTES], fb2[EPD4G_FB_BYTES], mask[EPD4G_MASK_BYTES], img[EPD4G_BW_FB_BYTES];
++    long loops, worst; int ms;
++    const long slice_limit = (long)EPD4G_ROWS_PER_POLL * EPD4G_FB_STRIDE + 400;   /* rows + a few register writes */
++
++    sim_bw = 0; busy_until = 0;
++    random_fb(fb);
++    CHECK(epd4g_start_init() == EPD4G_OK, "start init");
++    CHECK(epd4g_is_busy(), "busy after start");
++    CHECK(epd4g_start_init() == EPD4G_ERR_BUSY, "second job while running");
++    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_ERR_BUSY, "full while init is running");
++    CHECK(epd4g_start_sleep() == EPD4G_ERR_BUSY, "sleep while running");
++    worst = run_async(&loops, &ms);
++    CHECK(!epd4g_is_busy() && epd4g_result() == EPD4G_OK, "init result %d", epd4g_result());
++    CHECK(worst <= slice_limit, "init: %ld bytes in one poll", worst);
++
++    /* a full refresh: bounded work per poll, the main loop keeps running during the waveform */
++    epd4g_set_done_cb(done_cb, NULL); cb_calls = 0;
++    mode_partial = 0;
++    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "start full");
++    worst = run_async(&loops, &ms);
++    CHECK(epd4g_result() == EPD4G_OK && cb_calls == 1 && cb_rc == EPD4G_OK, "full result / callback");
++    CHECK(worst <= slice_limit, "full: %ld bytes in one poll (limit %ld)", worst, slice_limit);
++    CHECK(ms >= 100 * 20 && loops > 100, "full: %d ms, %ld loop passes: main loop starved?", ms, loops);
++    check_ink_equals(fb, "async full");
++    epd4g_set_done_cb(NULL, NULL);
++
++    /* the frame buffer is free again as soon as its data is sent, long before the job ends */
++    {
++        static uint8_t keep[EPD4G_FB_BYTES];
++        memcpy(keep, fb, sizeof keep);
++        CHECK(!epd4g_data_busy(), "no data in use when idle");
++        mode_partial = 0;
++        CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_OK && epd4g_data_busy(), "data in use after start");
++        long released_at = -1, polls = 0;
++        while (epd4g_is_busy()) {
++            epd4g_poll(); polls++; now_ms++;
++            if (released_at < 0 && !epd4g_data_busy()) { released_at = polls; epd4g_fb_fill(fb, EPD4G_BLACK); }   /* next frame is drawn meanwhile */
++            if (polls > 100000) break;
++        }
++        CHECK(released_at > 0 && released_at < polls / 4, "data released at poll %ld of %ld", released_at, polls);
++        CHECK(epd4g_result() == EPD4G_OK, "full result");
++        check_ink_equals(keep, "full with the buffer overwritten after release");
++        memcpy(fb, keep, sizeof fb);
++    }
++
++    /* partial through the diff helper: same picture as the blocking call, no panel access if equal */
++    memcpy(fb2, fb, sizeof fb2);
++    for (int y = 50; y < 80; y++) for (int x = 40; x < 100; x++) epd4g_fb_set(fb2, x, y, (uint8_t)((x * 3 + y) & 3));
++    uint32_t changed = 0;
++    mode_partial = 1; pass_no = 0; expect_fb = fb2;
++    clear_stream();
++    CHECK(epd4g_start_partial_diff(fb, fb2, NULL, &changed) == EPD4G_OK && changed > 0, "start partial diff");
++    CHECK(epd4g_start_partial_diff(fb, fb2, NULL, &changed) == EPD4G_ERR_BUSY, "diff while the mask is in use");
++    uint32_t t_mid = now_ms;
++    worst = run_async(&loops, &ms);
++    mode_partial = 0;
++    CHECK(epd4g_result() == EPD4G_OK, "partial result");
++    CHECK(worst <= slice_limit, "partial: %ld bytes in one poll", worst);
++    CHECK(now_ms - t_mid >= 40 * 20 && loops > 40, "partial waveform wait: %u ms", now_ms - t_mid);
++    check_ink_equals(fb2, "async partial");
++    CHECK(!epd4g_data_busy(), "data free after the job");
++    CHECK(epd4g_start_partial_diff(fb2, fb2, NULL, &changed) == EPD4G_OK && changed == 0 && !epd4g_is_busy(), "no change: no job");
++
++    /* the blocking twin sends exactly the same bytes */
++    {
++        static uint16_t a[8192]; int na;
++        memcpy(fb, fb2, sizeof fb);
++        for (int y = 120; y < 140; y++) for (int x = 10; x < 60; x++) epd4g_fb_set(fb, x, y, (uint8_t)((x + y * 5) & 3));
++        mode_partial = 1; pass_no = 0; expect_fb = fb; clear_stream();
++        CHECK(epd4g_start_partial_diff(fb2, fb, NULL, &changed) == EPD4G_OK, "start");
++        run_async(NULL, NULL);
++        na = stream_n < 8192 ? stream_n : 8192; memcpy(a, stream, (size_t)na * sizeof a[0]);
++        /* panel state is now "fb"; redo the same update (fb2 -> fb) from the old picture in blocking mode */
++        mode_partial = 0;
++        CHECK(epd4g_full(fb2, EPD4G_FULL_FAST) == EPD4G_OK, "restore");
++        mode_partial = 1; pass_no = 0; expect_fb = fb; clear_stream();
++        CHECK(epd4g_partial_diff(fb2, fb, NULL, &changed) == EPD4G_OK, "blocking diff");
++        CHECK(stream_n == na && memcmp(stream, a, (size_t)na * sizeof a[0]) == 0, "blocking and non-blocking streams differ");
++        mode_partial = 0;
++    }
++
++    /* 1-bit jobs: chained from the callback, as a UI state machine would */
++    sim_bw = 1; bw_random(img);
++    CHECK(epd4g_start_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "start bw init");
++    CHECK(epd4g_start_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_ERR_BUSY, "bw full while init");
++    worst = run_async(&loops, &ms);
++    CHECK(epd4g_result() == EPD4G_OK, "bw init result");
++    CHECK(epd4g_start_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "start bw full");
++    worst = run_async(&loops, &ms);
++    CHECK(worst <= (long)EPD4G_ROWS_PER_POLL * EPD4G_BW_STRIDE + 400, "bw full: %ld bytes in one poll", worst);
++    check_bw_shows(img, "async bw full");
++    epd4g_rect_t r = { 30, 60, 90, 90 };
++    bw_random(img);
++    uint32_t t1 = now_ms;
++    CHECK(epd4g_start_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "start bw partial");
++    worst = run_async(&loops, &ms);
++    CHECK(epd4g_result() == EPD4G_OK, "bw partial result");
++    CHECK(now_ms - t1 >= 300 && loops > 200, "bw partial: main loop ran %ld passes in %u ms", loops, now_ms - t1);
++    sim_bw = 0;
++
++    /* abort drops the job and requires a new init */
++    CHECK(epd4g_start_init() == EPD4G_OK, "start");
++    epd4g_abort();
++    CHECK(!epd4g_is_busy(), "abort");
++    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_ERR_NOT_INIT, "after abort");
++
++    /* timeout in the non-blocking interface */
++    busy_stuck = 0; busy_until = 0;
++    CHECK(epd4g_start_init() == EPD4G_OK, "start");
++    run_async(NULL, NULL);
++    busy_stuck = 1;
++    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "start");
++    uint32_t t2 = now_ms;
++    run_async(NULL, NULL);
++    CHECK(epd4g_result() == EPD4G_ERR_TIMEOUT && now_ms - t2 >= EPD4G_BUSY_TIMEOUT_MS && now_ms - t2 < EPD4G_BUSY_TIMEOUT_MS + 1000, "timeout: rc %d after %u ms", epd4g_result(), now_ms - t2);
++    busy_stuck = 0; busy_until = 0;
++    (void)mask;
++}
++
+ int main(void)
+ {
+     test_init_matches_stock();
+@@ -376,6 +796,11 @@ int main(void)
+     test_power_and_sleep();
+     test_errors();
+     test_fb_helpers();
++    test_gray_skip_pass2();
++    test_bw_init_and_full_match_stock();
++    test_bw_partial();
++    test_bw_modes_and_errors();
++    test_async();
+     printf("epd4g host tests: %d display updates simulated, %s (%d failure%s)\n",
+            updates_seen, errors ? "FAILED" : "all passed", errors, errors == 1 ? "" : "s");
+     return errors ? 1 : 0;
+diff --git a/epd4g/tests/tools/gen_golden.c b/epd4g/tests/tools/gen_golden.c
+index afcf226..e93892c 100644
+--- a/epd4g/tests/tools/gen_golden.c
++++ b/epd4g/tests/tools/gen_golden.c
+@@ -47,6 +47,36 @@ int main(void)
+     printf("#define GOLDEN_PLANE24_LEN %d\n#define GOLDEN_PLANE24_FNV 0x%08Xu\n", n24, fnv(p24, n24));
+     printf("#define GOLDEN_PLANE26_LEN %d\n#define GOLDEN_PLANE26_FNV 0x%08Xu\n", n26, fnv(p26, n26));
+ 
++    /* ---- 1-bit mode ---- */
++    static uint8_t bw[5808], win[5808];
++    s = 777;
++    for (int i = 0; i < 5808; i++) { s = s * 1103515245u + 12345u; bw[i] = (uint8_t)(s >> 16); }
++    printf("#define GOLDEN_BW_SEED 777u\n");
++
++    n = 0; EPD_2IN7_V2_Init();
++    printf("static const uint16_t golden_bw_init[] = {");
++    for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);
++    printf(" };\n");
++    n = 0; EPD_2IN7_V2_Init_Fast();
++    printf("static const uint16_t golden_bw_init_fast[] = {");
++    for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);
++    printf(" };\n");
++
++    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Display_Base(bw);
++    printf("#define GOLDEN_BWBASE_P24_FNV 0x%08Xu\n#define GOLDEN_BWBASE_P26_FNV 0x%08Xu\n", fnv(p24, n24), fnv(p26, n26));
++    printf("#define GOLDEN_BWBASE_LEN %d\n", n24);
++    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Display_Fast(bw);
++    printf("#define GOLDEN_BWFAST_P24_FNV 0x%08Xu\n", fnv(p24, n24));
++    n = 0; n24 = n26 = 0; EPD_2IN7_V2_Clear();
++    printf("#define GOLDEN_BWCLEAR_P24_FNV 0x%08Xu\n", fnv(p24, n24));
++
++    /* partial window: pixels x 16..87, rows 40..99 (the stock call takes exclusive ends and a packed window buffer) */
++    for (int y = 40; y < 100; y++) memcpy(&win[(y - 40) * 9], &bw[y * 22 + 2], 9);
++    n = 0; EPD_2IN7_V2_Display_Partial(win, 16, 40, 88, 100);
++    {   uint32_t h = 2166136261u;
++        for (int i = 0; i < n; i++) { h ^= stream[i] & 0xFF; h *= 16777619u; h ^= stream[i] >> 8; h *= 16777619u; }
++        printf("#define GOLDEN_BWPART_LEN %d\n#define GOLDEN_BWPART_FNV 0x%08Xu\n", n, h); }
++
+     n = 0; EPD_2IN7_V2_Sleep();
+     printf("static const uint16_t golden_sleep[] = {");
+     for (int i = 0; i < n; i++) printf(" 0x%03X,", stream[i]);

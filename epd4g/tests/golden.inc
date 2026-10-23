@@ -23,4 +23,14 @@ static const uint16_t golden_init[] = {
 #define GOLDEN_PLANE24_FNV 0xAD8192B0u
 #define GOLDEN_PLANE26_LEN 5808
 #define GOLDEN_PLANE26_FNV 0x0DF25AB8u
+#define GOLDEN_BW_SEED 777u
+static const uint16_t golden_bw_init[] = { 0x012, 0x045, 0x100, 0x100, 0x107, 0x101, 0x04F, 0x100, 0x100, 0x011, 0x103, };
+static const uint16_t golden_bw_init_fast[] = { 0x012, 0x018, 0x180, 0x022, 0x1B1, 0x020, 0x01A, 0x164, 0x100, 0x045, 0x100, 0x100, 0x107, 0x101, 0x04F, 0x100, 0x100, 0x011, 0x103, 0x022, 0x191, 0x020, };
+#define GOLDEN_BWBASE_P24_FNV 0xF38333F3u
+#define GOLDEN_BWBASE_P26_FNV 0xF38333F3u
+#define GOLDEN_BWBASE_LEN 5808
+#define GOLDEN_BWFAST_P24_FNV 0xF38333F3u
+#define GOLDEN_BWCLEAR_P24_FNV 0x3D2B6BD5u
+#define GOLDEN_BWPART_LEN 559
+#define GOLDEN_BWPART_FNV 0xB2CB34B8u
 static const uint16_t golden_sleep[] = { 0x010, 0x101, };
