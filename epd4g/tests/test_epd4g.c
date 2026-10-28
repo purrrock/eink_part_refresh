@@ -44,7 +44,15 @@ static long     spi_bytes;               /* data + command bytes sent in total *
 
 /* 1-bit controller model: RAM window + cursor, old/new planes (1 = white), what the glass shows */
 static int      sim_bw;
-static uint8_t  bwn[EPD4G_BW_FB_BYTES], bwo[EPD4G_BW_FB_BYTES], bwshow[EPD4G_BW_FB_BYTES];
+static uint8_t  bwp[2][EPD4G_BW_FB_BYTES], bwshow[EPD4G_BW_FB_BYTES];
+static int      bw_n = 0;                /* index of the plane that command 0x24 writes and mode 2 treats as "new"; 0x26 -> 1 - bw_n */
+/* What the controller does with its two RAM planes after a display update:
+ *   0  copies new -> old (the original assumption of this model)
+ *   1  nothing
+ *   2  swaps the roles of the planes: the next 0x24 goes to the plane that was "old" so far.
+ *      This is what the real panel does (measured: after update n a partial window shows the image n
+ *      together with the images n-2, n-4 ... of the unchanged rows)  -> default. */
+static int      sim_ram_model = 2;
 static int      wx0, wx1 = 21, wy0, wy1 = 263, cx, cy, nargs, args[8];
 static int      bw_full_updates, bw_part_updates;
 
@@ -98,7 +106,7 @@ static int run_lut(int row, int d)
 
 static void bw_ram_write(int plane, uint8_t v)
 {
-    uint8_t *ram = plane ? bwo : bwn;
+    uint8_t *ram = bwp[plane ? 1 - bw_n : bw_n];
     if (cx >= 0 && cx < 22 && cy >= 0 && cy < 264) ram[cy * 22 + cx] = v;
     if (++cx > wx1) { cx = wx0; if (++cy > wy1) cy = wy0; }
 }
@@ -114,6 +122,7 @@ static void bw_reg_arg(int cmd, int v)
 
 static void bw_update(void)
 {
+    const uint8_t *bwn = bwp[bw_n], *bwo = bwp[1 - bw_n];
     if (last_ctrl & 0x08) { /* display mode 2: only pixels whose new and old RAM differ are driven */
         for (int i = 0; i < EPD4G_BW_FB_BYTES; i++) bwshow[i] = (uint8_t)((bwshow[i] & ~(bwn[i] ^ bwo[i])) | (bwn[i] & (bwn[i] ^ bwo[i])));
         bw_part_updates++;
@@ -121,7 +130,8 @@ static void bw_update(void)
         memcpy(bwshow, bwn, sizeof bwshow);
         bw_full_updates++;
     }
-    memcpy(bwo, bwn, sizeof bwo);
+    if (sim_ram_model == 0) memcpy(bwp[1 - bw_n], bwp[bw_n], sizeof bwp[0]);
+    else if (sim_ram_model == 2) bw_n = 1 - bw_n;
     updates_seen++;
 }
 
@@ -430,6 +440,13 @@ __attribute__((unused)) static uint32_t stream_fnv(int from)
     return h;
 }
 
+__attribute__((unused)) static uint32_t stream_fnv_to(int to)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < to && i < stream_n; i++) { h ^= stream[i] & 0xFF; h *= 16777619u; h ^= stream[i] >> 8; h *= 16777619u; }
+    return h;
+}
+
 static void check_bw_shows(const uint8_t *img, const char *what)
 {
     for (int i = 0; i < EPD4G_BW_FB_BYTES; i++)
@@ -484,6 +501,37 @@ static void test_bw_init_and_full_match_stock(void)
     sim_bw = 0;
 }
 
+/* A selected (inverted) menu row that walks down and up, with jumps over the edge (the sequence of the
+ * firmware self-test, scene S1). Each step refreshes the window of the old and the new row. Checked with
+ * every RAM model: with the stock stream alone the swapping controller leaves rows 1+3, 2+4, ... inverted. */
+static void test_bw_cursor_walk(void)
+{
+#if EPD4G_BW_RESYNC
+    static uint8_t img[EPD4G_BW_FB_BYTES];
+    static const int seq[] = { 0, 1, 2, 3, 4, 5, 6, 0, 6, 3, 1 };
+    const int band_h = 15, top = 25, n = (int)(sizeof seq / sizeof seq[0]);
+    for (int model = 0; model <= 2; model += 2) {     /* 0 = copy, 2 = swap (model 1, "old RAM never changes", contradicts the measurements) */
+        sim_ram_model = model; sim_bw = 1;
+        CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "walk: bw init");
+        for (int k = 0; k < n; k++) {
+            memset(img, 0xFF, sizeof img);                                   /* white page */
+            for (int y = top + seq[k] * band_h; y < top + (seq[k] + 1) * band_h; y++)
+                memset(&img[y * EPD4G_BW_STRIDE], 0x00, EPD4G_BW_STRIDE);    /* black (inverted) row */
+            if (k == 0) {
+                CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK, "walk: base");
+            } else {
+                const int a = seq[k - 1] < seq[k] ? seq[k - 1] : seq[k], b = seq[k - 1] < seq[k] ? seq[k] : seq[k - 1];
+                epd4g_rect_t r = { 0, top + a * band_h, EPD4G_WIDTH - 1, top + (b + 1) * band_h - 1 };
+                CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "walk: partial");
+            }
+            check_bw_shows(img, model == 0 ? "cursor walk (controller copies new->old)" :
+                                             "cursor walk (controller swaps RAM planes)");
+        }
+    }
+    sim_ram_model = 2; sim_bw = 0;
+#endif
+}
+
 static void test_bw_partial(void)
 {
     static uint8_t shown[EPD4G_BW_FB_BYTES], img[EPD4G_BW_FB_BYTES], g4[EPD4G_FB_BYTES], conv[EPD4G_BW_FB_BYTES], want[EPD4G_BW_FB_BYTES];
@@ -499,7 +547,9 @@ static void test_bw_partial(void)
     clear_stream(); rst_n = 0; bw_part_updates = 0;
     CHECK(epd4g_bw_partial(img, EPD4G_SRC_1BPP, &r0) == EPD4G_OK, "bw partial");
 #if EPD4G_BW_PARTIAL_RESET && !EPD4G_BW_KEEP_POWER
-    CHECK(stream_n == GOLDEN_BWPART_LEN && stream_fnv(0) == GOLDEN_BWPART_FNV, "partial stream differs from stock Display_Partial (len %d, fnv %08X)", stream_n, stream_fnv(0));
+    /* with EPD4G_BW_RESYNC the stock stream is followed by the window sent to RAM 0x24 once more */
+    CHECK(stream_n >= GOLDEN_BWPART_LEN && (EPD4G_BW_RESYNC || stream_n == GOLDEN_BWPART_LEN) &&
+          stream_fnv_to(GOLDEN_BWPART_LEN) == GOLDEN_BWPART_FNV, "partial stream differs from stock Display_Partial (len %d, fnv %08X)", stream_n, stream_fnv_to(GOLDEN_BWPART_LEN));
     CHECK(rst_n == 3 && rst_log[0] == 1 && rst_log[1] == 0 && rst_log[2] == 1, "partial starts with a hardware reset like the stock one");
 #endif
     CHECK(bw_part_updates == 1, "one partial update");
@@ -799,6 +849,7 @@ int main(void)
     test_gray_skip_pass2();
     test_bw_init_and_full_match_stock();
     test_bw_partial();
+    test_bw_cursor_walk();
     test_bw_modes_and_errors();
     test_async();
     printf("epd4g host tests: %d display updates simulated, %s (%d failure%s)\n",

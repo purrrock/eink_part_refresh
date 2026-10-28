@@ -98,6 +98,21 @@
 #define EPD4G_BW_PARTIAL_RESET 1
 #endif
 
+/** 1 = after every 1-bit partial update, once the waveform has finished, the same window is written to
+ *  RAM 0x24 a second time (the image buffer is read again, so epd4g_data_busy() stays 1 until that is done).
+ *
+ *  Why: a partial update drives the pixels whose "new" and "old" RAM differ, and on the real panel the
+ *  two RAM planes swap roles after every update (measured: the plane that 0x24 writes into is the one
+ *  that was "old" before). With only the stock Display_Partial() stream, after update n the window shows
+ *  image n together with the images n-2, n-4, ... of the unchanged rows: e.g. a menu cursor leaves
+ *  inverted rows behind on every second step. Rewriting the window into the (now swapped) 0x24 plane makes
+ *  both planes equal again, so the next partial update compares against what is really on the glass.
+ *  Harmless on a controller that does not swap (it just rewrites the plane with the same data).
+ *  0 = stock Display_Partial() stream only. */
+#ifndef EPD4G_BW_RESYNC
+#define EPD4G_BW_RESYNC 1
+#endif
+
 /** 1 = 1-bit updates leave the analog part powered (0xFC / 0xF4 / 0xC4 instead of 0xFF / 0xF7 /
  *  0xC7), saves ~300 ms per update; call epd4g_power_off() when idle. Needs
  *  EPD4G_BW_PARTIAL_RESET=0. NOT verified on hardware, so off by default. */

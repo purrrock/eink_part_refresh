@@ -642,7 +642,9 @@ static int job_bw_partial(void)
     send_cursor(J.xb0, J.y0);
     plane_begin(0, PASS_BW, J.y0, J.y1, J.xb0, J.xb1);
     CR_SLICE(plane_step() == 0);
+#if !EPD4G_BW_RESYNC
     s_data = 0;
+#endif
     J.ctl = EPD4G_BW_KEEP_POWER ? 0xFC : 0xFF;    /* 0xFF: load LUT, display mode 2, power down */
     g_trigger(J.ctl);
     s_powered = EPD4G_BW_KEEP_POWER;
@@ -650,6 +652,15 @@ static int job_bw_partial(void)
     s_border_part = 1;
     s_fast_lut = 0;                               /* the partial waveform replaced it */
     WAIT_BUSY("bw partial");
+#if EPD4G_BW_RESYNC
+    /* The RAM planes swapped roles during the update: write the window into the plane that 0x24 now
+     * addresses, so that both planes hold the picture that is on the glass (see EPD4G_BW_RESYNC). */
+    send_window(J.xb0, J.xb1, J.y0, J.y1);
+    send_cursor(J.xb0, J.y0);
+    plane_begin(0, PASS_BW, J.y0, J.y1, J.xb0, J.xb1);
+    CR_SLICE(plane_step() == 0);
+    s_data = 0;
+#endif
     CR_END;
 }
 
