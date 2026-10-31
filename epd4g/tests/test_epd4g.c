@@ -237,12 +237,19 @@ static void test_full_deep_matches_stock(void)
     CHECK(epd4g_full(fb, EPD4G_FULL_DEEP) == EPD4G_OK, "full deep failed");
     CHECK(n24 == GOLDEN_PLANE24_LEN && fnv(p24, n24) == GOLDEN_PLANE24_FNV, "RAM 0x24 differs from the stock 4-gray display (%08X)", fnv(p24, n24));
     CHECK(n26 == GOLDEN_PLANE26_LEN && fnv(p26, n26) == GOLDEN_PLANE26_FNV, "RAM 0x26 differs from the stock 4-gray display (%08X)", fnv(p26, n26));
-    CHECK(lut_frames() == 262, "deep waveform is %d frames, stock has 262", lut_frames());
+    /* stock 262 frames; the two gray levels (stock 3 and 8 frames) appear twice in the waveform */
+    const int deep_expect = 262 - 2 * ((3 + 8) - (EPD4G_FULL_T_LIGHT + EPD4G_FULL_T_DARK));
+    CHECK(lut_frames() == deep_expect, "deep waveform is %d frames, expected %d", lut_frames(), deep_expect);
     /* the LUT sent is the stock one: compare with the 0x32 block of the stock init stream */
     int ng = (int)(sizeof golden_init / sizeof golden_init[0]), start = -1;
     for (int i = 0; i < ng; i++) if (golden_init[i] == 0x032) { start = i + 1; break; }
-    for (int i = 0; start > 0 && i < 153; i++)
-        if (lutb[i] != (golden_init[start + i] & 0xFF)) { CHECK(0, "deep LUT differs from stock at byte %d", i); break; }
+    for (int i = 0; start > 0 && i < 153; i++) {
+        uint8_t want = (uint8_t)(golden_init[start + i] & 0xFF);
+        /* the gray-level durations are the only bytes allowed to differ from the stock LUT */
+        if (i == 60 + 3) want = EPD4G_FULL_T_LIGHT; else if (i == 60 + 4) want = EPD4G_FULL_T_DARK;
+        else if (i == 74 + 1) want = EPD4G_FULL_T_LIGHT; else if (i == 74 + 3) want = EPD4G_FULL_T_DARK;
+        if (lutb[i] != want) { CHECK(0, "deep LUT differs from stock at byte %d", i); break; }
+    }
     check_ink_equals(fb, "full deep");
 }
 
@@ -252,7 +259,8 @@ static void test_full_fast(void)
     random_fb(fb);
     mode_partial = 0;
     CHECK(epd4g_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "full fast failed");
-    int expect = 46 + (2 * EPD4G_FULL_SHAKE_TP + 2) * (EPD4G_FULL_SHAKE_RP + 1) + 46 + 2;
+    const int gr = EPD4G_FULL_T_LIGHT + EPD4G_FULL_T_DARK;
+    int expect = (35 + gr) + (2 * EPD4G_FULL_SHAKE_TP + 2) * (EPD4G_FULL_SHAKE_RP + 1) + (35 + gr) + 2;
     CHECK(lut_frames() == expect, "fast waveform %d frames, expected %d", lut_frames(), expect);
     check_ink_equals(fb, "full fast");
 }

@@ -48,6 +48,8 @@
 #define EPD4G_STATIC_ASSERT(name, cond) typedef char epd4g_assert_##name[(cond) ? 1 : -1]
 EPD4G_STATIC_ASSERT(light_le_dark,  EPD4G_T_LIGHT <= EPD4G_T_DARK);
 EPD4G_STATIC_ASSERT(light_pos,      EPD4G_T_LIGHT >= 1);
+EPD4G_STATIC_ASSERT(full_gray,      EPD4G_FULL_T_LIGHT >= 1 && EPD4G_FULL_T_DARK <= 255 &&
+                                    EPD4G_FULL_T_LIGHT <= EPD4G_FULL_T_DARK);
 EPD4G_STATIC_ASSERT(times_le_255,   EPD4G_T_BLACK <= 255 && EPD4G_T_WHITE <= 255 &&
                                     EPD4G_T_DARK <= 255 && EPD4G_FULL_SHAKE_TP <= 255 &&
                                     EPD4G_FULL_SHAKE_RP <= 255);
@@ -280,6 +282,13 @@ static void lut_build_p2(uint8_t *l)
 static void lut_build_full(uint8_t *l, epd4g_full_mode_t mode)
 {
     memcpy(l, lut_stock, 153);
+    /* gray levels: row 1 (light) and row 2 (dark) get VSL in group 0 (phases C, D) and the same
+     * number of VSH frames in group 2 (phases B, C), so the waveform stays DC balanced.
+     * Stock values: light 3, dark 8. Fewer frames = lighter gray. */
+    l[60 + 0 * 7 + 3] = EPD4G_FULL_T_LIGHT;       /* g0 TPC: row 1 VSL */
+    l[60 + 0 * 7 + 4] = EPD4G_FULL_T_DARK;        /* g0 TPD: row 2 VSL */
+    l[60 + 2 * 7 + 1] = EPD4G_FULL_T_LIGHT;       /* g2 TPB: row 1 VSH */
+    l[60 + 2 * 7 + 3] = EPD4G_FULL_T_DARK;        /* g2 TPC: row 2 VSH */
     if (mode == EPD4G_FULL_FAST) {
         l[60 + 1 * 7 + 0] = EPD4G_FULL_SHAKE_TP;      /* TPA */
         l[60 + 1 * 7 + 3] = EPD4G_FULL_SHAKE_TP;      /* TPC */
