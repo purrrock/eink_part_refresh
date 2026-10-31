@@ -27,7 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "eink_demo.h"
 #ifndef EINK_DIAG
-#define EINK_DIAG 0     /* 1 = журнал в USART2 (printf), см. CMakeLists.txt */
+#define EINK_DIAG 1     /* 1 = журнал в USART2 (printf), см. CMakeLists.txt */
 #endif
 /* USER CODE END Includes */
 
