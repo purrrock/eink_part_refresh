@@ -23,10 +23,10 @@
  * Duration = max(T_WHITE, T_BLACK) + T_DARK frames  (45 + 8 = 53 -> ~1.06 s).
  * ------------------------------------------------------------------------- */
 #ifndef EPD4G_T_LIGHT
-#define EPD4G_T_LIGHT   2    /**< light gray: VSH after the erase (stock 3; fewer frames = lighter) */
+#define EPD4G_T_LIGHT   1    /**< light gray: VSH after the erase (stock 3; fewer frames = lighter) */
 #endif
 #ifndef EPD4G_T_DARK
-#define EPD4G_T_DARK    5    /**< dark gray: cumulative VSH after the erase (stock 8, >= LIGHT)     */
+#define EPD4G_T_DARK    3    /**< dark gray: cumulative VSH after the erase (stock 8, >= LIGHT)     */
 #endif
 /* The same two grays in the full refresh (stock LUT: 3 and 8 frames). By default they follow
  * the partial-update values, so the background drawn by a full refresh and the pixels redrawn
