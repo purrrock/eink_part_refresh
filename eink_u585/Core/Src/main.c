@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include "eink_demo.h"
 #ifndef EINK_DIAG
 #define EINK_DIAG 1     /* 1 = журнал в USART2 (printf), см. CMakeLists.txt */
