@@ -400,6 +400,8 @@ epd4g/                      библиотека (то, что подключа�
   CMakeLists.txt            INTERFACE-библиотека epd4g
   NOTICE.md                 уведомление о коде Waveshare
 Core/, Drivers/, cmake/     эталонный проект STM32CubeMX (STM32F411CEU6)
+demo/                       демо-приложение (eink_demo.c/.h), общее для всех МК-проектов
+eink_u585/                  проект STM32CubeMX для STM32U585CIU6 (тот же дисплей и те же пины)
 Docs/                       фото результата, лог измерений
 ```
 
