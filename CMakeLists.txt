@@ -47,7 +47,10 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Самодостаточная: Waveshare-библиотека и DEV_Config больше не нужны.
 # ---------------------------------------------------------------------------
 # Опции демо-прошивки (cmake -DEINK_DIAG=OFF ...):
-option(EINK_DIAG    "Печатать журнал демо в USART2 (printf)" ON)
+option(EINK_DIAG    "Печатать журнал демо в отладочный USART (printf)" ON)
+# Номер USART отладочной консоли: 1 = USART1 (PA9/PA10), 2 = USART2 (PA2/PA3)
+set(EINK_DEBUG_USART "1" CACHE STRING "Номер USART для отладочной консоли (1 или 2)")
+set_property(CACHE EINK_DEBUG_USART PROPERTY STRINGS 1 2)
 option(EINK_PROFILE "Печатать время по фазам каждого обновления (нужен EINK_DIAG)" OFF)
 
 set(EPD4G_PROFILE ${EINK_PROFILE})          # передаём опцию библиотеке
@@ -71,6 +74,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
     EINK_DIAG=$<BOOL:${EINK_DIAG}>
     EINK_PROFILE=$<BOOL:${EINK_PROFILE}>
+    EINK_DEBUG_USART=${EINK_DEBUG_USART}
     # Настройки библиотеки (все необязательные, значения по умолчанию - в epd4g/include/epd4g_config.h):
     # EPD4G_KEEP_POWER=0
     # EPD4G_FULL_SHAKE_RP=1

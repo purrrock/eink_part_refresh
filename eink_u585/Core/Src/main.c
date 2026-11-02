@@ -27,8 +27,9 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "eink_demo.h"
+#include "debug_uart.h"   /* выбор USART консоли: EINK_DEBUG_USART (1 или 2) */
 #ifndef EINK_DIAG
-#define EINK_DIAG 1     /* 1 = журнал в USART2 (printf), см. CMakeLists.txt */
+#define EINK_DIAG 1     /* 1 = журнал в отладочный USART (printf), см. CMakeLists.txt */
 #endif
 /* USER CODE END Includes */
 
@@ -102,7 +103,8 @@ int main(void)
   printf("\r\n=== eink_part_refresh boot ===\r\n");
   printf("[BOOT] SystemCoreClock=%lu Hz, HAL tick=%lu ms\r\n",
          (unsigned long)SystemCoreClock, (unsigned long)HAL_GetTick());
-  printf("[BOOT] USART2=115200 8N1, SPI1 display interface initialized\r\n");
+  printf("[BOOT] %s=115200 8N1, SPI1 display interface initialized\r\n",
+         DBG_UART_NAME);
   printf("[BOOT] EINK_BUSY PB2 level before panel init: %u\r\n",
          (unsigned)HAL_GPIO_ReadPin(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin));
 #endif
@@ -178,18 +180,19 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 #if EINK_DIAG
-/* printf() -> _write() in syscalls.c -> __io_putchar() -> USART2. */
+/* printf() -> _write() in syscalls.c -> __io_putchar() -> DBG_UART_HANDLE
+ * (USART1 по умолчанию, см. debug_uart.h). */
 int __io_putchar(int ch)
 {
   uint8_t byte;
   if (ch == '\n') {
     byte = '\r';
-    if (HAL_UART_Transmit(&huart2, &byte, 1, 1000) != HAL_OK) {
+    if (HAL_UART_Transmit(&DBG_UART_HANDLE, &byte, 1, 1000) != HAL_OK) {
       return EOF;
     }
   }
   byte = (uint8_t)ch;
-  if (HAL_UART_Transmit(&huart2, &byte, 1, 1000) != HAL_OK) {
+  if (HAL_UART_Transmit(&DBG_UART_HANDLE, &byte, 1, 1000) != HAL_OK) {
     return EOF;
   }
   return ch;

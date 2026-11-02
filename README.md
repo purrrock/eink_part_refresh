@@ -337,7 +337,7 @@ while (1) {
 |---|---|---|
 | Сообщения библиотеки | определить `EPD4G_LOG` (printf-подобный макрос), напр. в проектном заголовке: `#include <stdio.h>` и `#define EPD4G_LOG(...) printf(__VA_ARGS__)` | `[epd4g] BUSY timeout in …`, `[epd4g] init done` |
 | Время по фазам | CMake: `-DEPD4G_PROFILE=ON` (или `-DEPD4G_PROFILE`) | `epd4g_get_profile()` → `setup, spi1, wait1, spi2, wait2` (мс); `wait*` — волна панели + питание, `spi*` — передача |
-| Журнал демо в UART | CMake: `-DEINK_DIAG=ON` (по умолчанию ON в демо-проекте) | USART2, 115200 8N1: `[INIT]`, `[FRAME]`, `[UPDATE] … complete in N ms` |
+| Журнал демо в UART | CMake: `-DEINK_DIAG=ON` (по умолчанию ON в демо-проекте) | USART1 (по умолчанию, см. `EINK_DEBUG_USART`), 115200 8N1: `[INIT]`, `[FRAME]`, `[UPDATE] … complete in N ms` |
 | Время по фазам в журнале демо | `-DEINK_PROFILE=ON` (+ `EINK_DIAG`) | строка `[PROF] …` после каждого обновления |
 
 Пример журнала демо (`EINK_DIAG=ON`, `EINK_PROFILE=ON`):
@@ -388,7 +388,8 @@ cmake --build build/Debug
 
 | Опция | По умолчанию | Смысл |
 |---|---|---|
-| `EINK_DIAG` | ON | журнал в USART2 (printf). OFF — без `printf`, прошивка ≈ 9,5 КБ |
+| `EINK_DIAG` | ON | журнал в отладочный USART (printf). OFF — без `printf`, прошивка ≈ 9,5 КБ |
+| `EINK_DEBUG_USART` | 1 | номер USART консоли: `1` = USART1 (PA9 TX / PA10 RX), `2` = USART2 (PA2 TX / PA3 RX) |
 | `EINK_PROFILE` | OFF | печать времени по фазам, включает `EPD4G_PROFILE` |
 
 Параметры демо (`-D…` в `CMakeLists.txt`): `EINK_ROT` (ориентация), `EINK_FULL_REFRESH_EVERY` (период полного обновления, 0 — никогда), `EINK_STEP_X`, `EINK_STEP_Y`, `EINK_BW_DEMO` (0 — без 1-bit фазы), `EINK_BW_EVERY`, `EINK_BW_STEPS`.
