@@ -16,7 +16,7 @@
  *   memcpy(prev, fb, sizeof fb);
  *   for (;;) {
  *       change_a_few_pixels(fb);
- *       epd4g_partial_diff(prev, fb, NULL, NULL);    // ~1.4 s, no full-screen flash
+ *       epd4g_partial_diff(prev, fb, NULL, NULL);    // ~1.3 s, no full-screen flash
  *       memcpy(prev, fb, sizeof fb);
  *   }
  * @endcode
@@ -24,7 +24,7 @@
  * Two ways to call the library (both drive the same state machine):
  *
  *   blocking      epd4g_init(), epd4g_full(), epd4g_partial(), ... return when the panel
- *                 is done (partial ~1.4 s, full ~2.9 s with the default configuration).
+ *                 is done (partial ~1.3 s, full ~2.9 s with the default configuration).
  *
  *   non-blocking  epd4g_start_xxx() only queues the job and returns at once; call
  *                 epd4g_poll() from the main loop until it returns 0. One poll call takes
@@ -113,15 +113,21 @@ int epd4g_full(const uint8_t *fb, epd4g_full_mode_t mode);
 /** Partial refresh: only the pixels set in @p mask are redrawn, taking their target
  *  grays from @p fb. Pixels with a 0 mask bit must hold on the panel what @p fb
  *  holds for them. Requires a previous epd4g_full() so that the panel content is known.
- *  If no masked pixel is gray (only black and white) the second pass is skipped: ~0.9 s
- *  instead of ~1.1 s of waveform with the default configuration. */
+ *  If no masked pixel is gray (only black and white) the second pass is skipped (saves ~0.2 s).
+ *
+ *  Automatic full refresh: after EPD4G_PARTIALS_BEFORE_FULL (default 10) partial updates in a row the
+ *  next request is carried out as a full refresh of @p fb (EPD4G_AUTO_FULL_MODE) instead: the result is
+ *  the same picture, but the whole screen flashes and it takes ~3 s. See epd4g_full_due(). */
 int epd4g_partial(const uint8_t *fb, const uint8_t *mask);
 
 #if EPD4G_INTERNAL_MASK
 /* The helpers below live in epd4g_fb.c and share one internal 5808-byte mask buffer, which a
  * running (non-blocking) job keeps in use: the start functions return EPD4G_ERR_BUSY meanwhile. */
 
-/** Partial refresh of a rectangle (native coordinates, inclusive). */
+/* Every start function checks its arguments and the state first and builds the mask afterwards. */
+
+/** Partial refresh of a rectangle (native coordinates, inclusive). Pixels of the rectangle that did
+ *  not change are driven again too; prefer epd4g_partial_diff() when a previous frame is available. */
 int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
 
 /** Convenience: compare @p prev (what is on the panel) with @p cur (what should be there),
@@ -131,9 +137,10 @@ int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
 int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
                        const epd4g_rect_t *roi, uint32_t *changed);
 
-/** Non-blocking twins. If epd4g_start_partial_diff() reports *changed == 0 no job was started
- *  (and the panel is not touched). @p cur must stay unchanged until the job is finished;
- *  @p prev is only read inside the call. */
+/** Non-blocking twins. If epd4g_start_partial_diff() reports *changed == 0 the panel is not touched:
+ *  a no-op job is queued (see epd4g_start_noop()) that finishes in the next epd4g_poll() with
+ *  EPD4G_OK and calls the done callback, so a callback-driven update chain never stalls.
+ *  @p cur must stay unchanged until the job is finished; @p prev is only read inside the call. */
 int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect);
 int epd4g_start_partial_diff(const uint8_t *prev, const uint8_t *cur,
                              const epd4g_rect_t *roi, uint32_t *changed);
@@ -149,6 +156,15 @@ int epd4g_start_full(const uint8_t *fb, epd4g_full_mode_t mode);
 int epd4g_start_partial(const uint8_t *fb, const uint8_t *mask);
 int epd4g_start_power_off(void);
 int epd4g_start_sleep(void);
+
+/** A job that does nothing: it finishes with EPD4G_OK in the next epd4g_poll() (the done callback is
+ *  called). Used by the library when there is nothing to send (no changed pixels, panel already
+ *  powered off / asleep); applications can use it to keep one uniform job flow. */
+int epd4g_start_noop(void);
+
+/** Status the 4-gray start functions would return for the current panel state: EPD4G_OK,
+ *  EPD4G_ERR_NOT_INIT or EPD4G_ERR_MODE (the panel is in 1-bit mode). Does not touch the panel. */
+int epd4g_gray_ready(void);
 
 /** Advance the running job. Returns EPD4G_PENDING (1) while it is still running and 0 when no
  *  job is running (finished or none). Call it often (every main-loop pass); it never blocks,
@@ -167,6 +183,19 @@ int epd4g_data_busy(void);
 /** Status code of the last finished job (EPD4G_OK or an error). */
 int epd4g_result(void);
 
+/* ---------------------- full refresh after N partial updates --------------------- */
+
+/** Number of partial updates (4-gray or 1-bit) since the last full refresh. */
+unsigned epd4g_partials_since_full(void);
+
+/** 1 if the limit is reached, i.e. the next partial request will be carried out as a full refresh.
+ *  Lets the application choose a convenient moment (or call epd4g_full() itself). */
+int epd4g_full_due(void);
+
+/** Change the limits at run time (defaults: EPD4G_PARTIALS_BEFORE_FULL / EPD4G_BW_PARTIALS_BEFORE_FULL).
+ *  0 = never promote a partial update to a full refresh in that mode. */
+void epd4g_set_partials_before_full(unsigned gray, unsigned bw);
+
 /** Optional: called from epd4g_poll() when a job has finished, with its status code. The
  *  callback may start the next job. Pass NULL to remove it. */
 typedef void (*epd4g_done_cb_t)(int rc, void *ctx);
@@ -181,7 +210,8 @@ int epd4g_wait(void);
 void epd4g_abort(void);
 
 /** Power the panel's analog part down. Only needed with EPD4G_KEEP_POWER=1 when the
- *  display goes idle; the next update powers it up again (adds ~300 ms once). */
+ *  display goes idle (by default epd4g_poll() does it after EPD4G_AUTO_POWEROFF_MS of idle time); the next update
+ *  powers it up again (adds ~300 ms once). If the analog part is already off nothing is sent. */
 int epd4g_power_off(void);
 
 /** Power down and enter deep sleep (lowest consumption), from either mode.

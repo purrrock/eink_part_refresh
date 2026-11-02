@@ -1,3 +1,4 @@
+[Примечание] Замер сделан со значениями T_DARK=8, T_LIGHT=3. Сейчас по умолчанию T_DARK=4, T_LIGHT=1: второй проход короче на ≈ 80 мс.
 Измерено на железе: Waveshare 2.7" V2 HAT + STM32F411CEU6 (HSI 16 MHz, SPI1 8 MHz), STM32 HAL, сборка Debug.
 Конфигурация по умолчанию: EPD4G_T_BLACK=45, T_WHITE=40, T_DARK=8, T_LIGHT=3, KEEP_POWER=1, FULL_SHAKE_RP=0,
 полное обновление каждое 8-е. EPD4G_PROFILE=ON, EINK_PROFILE=ON.

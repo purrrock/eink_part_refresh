@@ -20,7 +20,8 @@
  *   pass 1: black pixels get VSH for EPD4G_T_BLACK frames, every other updated
  *           pixel gets VSL for EPD4G_T_WHITE frames (saturates to white);
  *   pass 2: light / dark gray pixels get VSH for EPD4G_T_LIGHT / EPD4G_T_DARK frames.
- * Duration = max(T_WHITE, T_BLACK) + T_DARK frames  (45 + 8 = 53 -> ~1.06 s).
+ * Duration = max(T_WHITE, T_BLACK) + T_DARK frames  (45 + 4 = 49 -> ~0.98 s of waveform,
+ * plus ~0.13 s of fixed overhead per 0x20 command and the SPI transfers).
  * ------------------------------------------------------------------------- */
 #ifndef EPD4G_T_LIGHT
 #define EPD4G_T_LIGHT   1    /**< light gray: VSH after the erase (stock 3; fewer frames = lighter) */
@@ -67,6 +68,39 @@
  * ------------------------------------------------------------------------- */
 #ifndef EPD4G_KEEP_POWER
 #define EPD4G_KEEP_POWER 1
+#endif
+
+/** Automatic power-off of the analog part (EPD4G_KEEP_POWER=1 or EPD4G_BW_KEEP_POWER=1).
+ *  N > 0 (default 500) = epd4g_poll() starts a power-off job by itself when the panel has been idle for N ms
+ *  while its analog part is still on (the panel must not stay in the high-voltage state for long).
+ *  Needs epd4g_poll() to be called from the main loop (the blocking API alone never polls while idle:
+ *  such an application must call epd4g_power_off() / epd4g_sleep() itself).
+ *  0 = off: the application is fully responsible for epd4g_power_off() / epd4g_sleep().
+ *  Updates that follow each other within N ms keep the analog part on (no ~0.3 s power-up penalty).
+ *  The automatic job is silent (no done callback, epd4g_result() is not touched) but it is a
+ *  normal job: epd4g_is_busy() is 1 for ~0.3 s and a start function returns EPD4G_ERR_BUSY meanwhile. */
+#ifndef EPD4G_AUTO_POWEROFF_MS
+#define EPD4G_AUTO_POWEROFF_MS 500
+#endif
+
+/* ------------------------------------------------------------------------- *
+ * Automatic full refresh. Partial updates leave traces that only a full refresh removes; the
+ * library counts partial updates and, when the limit is reached, performs the next partial request
+ * as a full refresh of the same frame (the picture is exactly the requested one, but the whole
+ * screen flashes and it takes ~3 s). 0 = never (the application decides, see epd4g_full_due()).
+ * One counter for both modes; any full refresh (4-gray or 1-bit) resets it.
+ * Run time override: epd4g_set_partials_before_full().
+ * ------------------------------------------------------------------------- */
+#ifndef EPD4G_PARTIALS_BEFORE_FULL
+#define EPD4G_PARTIALS_BEFORE_FULL    10   /**< 4-gray: the 11th partial request becomes a full refresh */
+#endif
+#ifndef EPD4G_BW_PARTIALS_BEFORE_FULL
+#define EPD4G_BW_PARTIALS_BEFORE_FULL EPD4G_PARTIALS_BEFORE_FULL   /**< 1-bit mode */
+#endif
+/** 4-gray full refresh mode used for the automatic one (the 1-bit mode always uses EPD4G_BW_NORMAL,
+ *  which also works after deep sleep: the library runs epd4g_bw_init() first if needed). */
+#ifndef EPD4G_AUTO_FULL_MODE
+#define EPD4G_AUTO_FULL_MODE   EPD4G_FULL_FAST
 #endif
 
 /* ------------------------------------------------------------------------- *

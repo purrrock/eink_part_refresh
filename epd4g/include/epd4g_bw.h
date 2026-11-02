@@ -69,7 +69,11 @@ int epd4g_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode);
 /** Full refresh to white (stock Clear). */
 int epd4g_bw_clear(epd4g_bw_mode_t mode);
 
-/** Partial refresh of @p rect (native coordinates, inclusive; x is widened to whole bytes, i.e.
+/** After EPD4G_BW_PARTIALS_BEFORE_FULL (default 10) partial updates in a row the request is carried out
+ *  as a full refresh (EPD4G_BW_NORMAL) of the same frame instead; after deep sleep the library runs
+ *  epd4g_bw_init() first. See epd4g_full_due().
+ *
+ *  Partial refresh of @p rect (native coordinates, inclusive; x is widened to whole bytes, i.e.
  *  8 pixel columns; NULL = whole screen). The rows of @p img inside the window are sent, so
  *  @p img is a full-screen frame. Needs a previous epd4g_bw_full() after epd4g_bw_init(),
  *  otherwise EPD4G_ERR_NO_BASE. */

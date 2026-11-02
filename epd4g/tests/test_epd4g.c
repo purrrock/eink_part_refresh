@@ -343,7 +343,14 @@ static void test_power_and_sleep(void)
     CHECK(epd4g_init() == EPD4G_OK, "re-init");
     clear_stream();
     CHECK(epd4g_sleep() == EPD4G_OK, "sleep");
-    CHECK(stream_n == 5 && stream[3] == golden_sleep[0] && stream[4] == golden_sleep[1], "sleep tail differs from the stock Sleep()");
+    /* the analog part is already off: only the stock Sleep() bytes, no redundant power-off */
+    CHECK(stream_n == 2 && stream[0] == golden_sleep[0] && stream[1] == golden_sleep[1], "sleep differs from the stock Sleep()");
+    /* analog part on: power-off first, then the stock Sleep() */
+    CHECK(epd4g_init() == EPD4G_OK && epd4g_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "full before sleep");
+    clear_stream();
+    CHECK(epd4g_sleep() == EPD4G_OK, "sleep (powered)");
+    CHECK(stream_n == 5 && stream[0] == 0x022 && stream[1] == 0x183 && stream[2] == 0x020 &&
+          stream[3] == golden_sleep[0] && stream[4] == golden_sleep[1], "powered sleep stream");
 #else
     CHECK(ctrl_c7 == 1 && ctrl_c4 == 0, "KEEP_POWER=0 must use 0xC7 (c4=%d c7=%d)", ctrl_c4, ctrl_c7);
     CHECK(epd4g_sleep() == EPD4G_OK, "sleep");
@@ -786,7 +793,12 @@ static void test_async(void)
     CHECK(now_ms - t_mid >= 40 * 20 && loops > 40, "partial waveform wait: %u ms", now_ms - t_mid);
     check_ink_equals(fb2, "async partial");
     CHECK(!epd4g_data_busy(), "data free after the job");
-    CHECK(epd4g_start_partial_diff(fb2, fb2, NULL, &changed) == EPD4G_OK && changed == 0 && !epd4g_is_busy(), "no change: no job");
+    /* no change: the panel is not touched, but a (no-op) job finishes in the next poll */
+    clear_stream(); cb_calls = 0; epd4g_set_done_cb(done_cb, NULL);
+    CHECK(epd4g_start_partial_diff(fb2, fb2, NULL, &changed) == EPD4G_OK && changed == 0 && epd4g_is_busy(), "no change: no-op job");
+    run_async(NULL, NULL);
+    CHECK(stream_n == 0 && epd4g_result() == EPD4G_OK && cb_calls == 1, "no change: panel untouched, callback called");
+    epd4g_set_done_cb(NULL, NULL);
 
     /* the blocking twin sends exactly the same bytes */
     {
@@ -844,8 +856,206 @@ static void test_async(void)
     (void)mask;
 }
 
+
+/* ===================== no-op jobs, automatic full refresh ================= */
+static void test_noop_jobs(void)
+{
+    static uint8_t fb[EPD4G_FB_BYTES], fb2[EPD4G_FB_BYTES];
+    uint32_t changed = 99;
+    sim_bw = 0; busy_until = 0; mode_partial = 0;
+    epd4g_fb_fill(fb, EPD4G_WHITE); memcpy(fb2, fb, sizeof fb2);
+    epd4g_fb_set(fb2, 5, 5, EPD4G_BLACK);
+
+    /* wrong state is reported before anything else, also when nothing differs */
+    epd4g_abort();
+    CHECK(epd4g_gray_ready() == EPD4G_ERR_NOT_INIT, "gray_ready before init");
+    CHECK(epd4g_start_partial_diff(fb, fb, NULL, &changed) == EPD4G_ERR_NOT_INIT, "diff before init");
+    CHECK(epd4g_init() == EPD4G_OK && epd4g_gray_ready() == EPD4G_OK, "init");
+    CHECK(epd4g_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "full");
+
+    epd4g_set_done_cb(done_cb, NULL);
+    /* blocking diff without changes: returns OK, nothing sent */
+    clear_stream(); cb_calls = 0;
+    CHECK(epd4g_partial_diff(fb, fb, NULL, &changed) == EPD4G_OK && changed == 0 && stream_n == 0 && cb_calls == 1, "blocking diff, no change");
+
+#if EPD4G_KEEP_POWER
+    /* the analog part is on after the full refresh: the first power_off is real, the second is a no-op */
+    clear_stream(); cb_calls = 0;
+    CHECK(epd4g_power_off() == EPD4G_OK && stream_n == 3 && cb_calls == 1, "power_off (real)");
+    clear_stream(); cb_calls = 0;
+    CHECK(epd4g_power_off() == EPD4G_OK && stream_n == 0 && cb_calls == 1, "power_off when already off sends nothing, callback called");
+#endif
+    /* sleep sends only the sleep command when the analog part is off (stock Sleep) */
+    clear_stream(); cb_calls = 0;
+    CHECK(epd4g_sleep() == EPD4G_OK && stream_n == 2 && stream[0] == golden_sleep[0] && stream[1] == golden_sleep[1], "sleep stream");
+    epd4g_set_done_cb(NULL, NULL);
+    CHECK(epd4g_init() == EPD4G_OK, "re-init");
+
+    /* the helpers refuse a busy library without touching the shared mask */
+    CHECK(epd4g_start_partial_diff(fb, fb2, NULL, &changed) == EPD4G_OK && changed == 1, "start diff");
+    CHECK(epd4g_start_noop() == EPD4G_ERR_BUSY, "noop while a job runs");
+    mode_partial = 1; pass_no = 0; expect_fb = fb2;
+    run_async(NULL, NULL);
+    mode_partial = 0;
+    check_ink_equals(fb2, "diff after noop tests");
+}
+
+static void test_auto_full_gray(void)
+{
+    static uint8_t a[EPD4G_FB_BYTES], b[EPD4G_FB_BYTES];
+    uint32_t changed;
+    int before;
+    sim_bw = 0; busy_until = 0; mode_partial = 0;
+    epd4g_set_partials_before_full(3, 0);
+    random_fb(a);
+    CHECK(epd4g_init() == EPD4G_OK && epd4g_full(a, EPD4G_FULL_FAST) == EPD4G_OK, "init + full");
+    CHECK(epd4g_partials_since_full() == 0 && !epd4g_full_due(), "counter after full");
+
+    for (int i = 1; i <= 3; i++) {                      /* three real partial updates: two passes each */
+        memcpy(b, a, sizeof b);
+        for (int y = 20 * i; y < 20 * i + 10; y++) for (int x = 30; x < 60; x++) epd4g_fb_set(b, x, y, (uint8_t)((x + y + i) & 3));
+        mode_partial = 1; pass_no = 0; expect_fb = b; before = updates_seen;
+        CHECK(epd4g_partial_diff(a, b, NULL, &changed) == EPD4G_OK && changed > 0, "partial %d", i);
+        mode_partial = 0;
+        CHECK(updates_seen - before <= 2 && epd4g_partials_since_full() == (unsigned)i, "partial %d counted (%u)", i, epd4g_partials_since_full());
+        check_ink_equals(b, "auto-full: partial");
+        memcpy(a, b, sizeof a);
+    }
+    CHECK(epd4g_full_due(), "full due after 3 partial updates");
+
+    /* nothing changed: no job to promote, the counter stays */
+    CHECK(epd4g_partial_diff(a, a, NULL, &changed) == EPD4G_OK && changed == 0 && epd4g_partials_since_full() == 3, "no-op does not count");
+
+    /* the 4th request becomes ONE full refresh of the same frame, and resets the counter */
+    memcpy(b, a, sizeof b);
+    for (int y = 100; y < 110; y++) for (int x = 70; x < 90; x++) epd4g_fb_set(b, x, y, (uint8_t)((x * 7 + y) & 3));
+    before = updates_seen;
+    CHECK(epd4g_partial_diff(a, b, NULL, &changed) == EPD4G_OK && changed > 0, "promoted partial");
+    CHECK(updates_seen - before == 1, "promoted request must be one full update, got %d", updates_seen - before);
+    check_ink_equals(b, "auto-full: picture after the promoted full refresh");
+    CHECK(epd4g_partials_since_full() == 0 && !epd4g_full_due(), "counter reset by the full refresh");
+    memcpy(a, b, sizeof a);
+
+    /* the rect variant is promoted too */
+    epd4g_set_partials_before_full(1, 0);
+    mode_partial = 1; pass_no = 0; expect_fb = a;
+    epd4g_rect_t r = { 0, 0, 20, 20 };
+    CHECK(epd4g_partial_rect(a, &r) == EPD4G_OK, "rect partial");
+    mode_partial = 0;
+    before = updates_seen;
+    CHECK(epd4g_partial_rect(a, &r) == EPD4G_OK && updates_seen - before == 1, "rect promoted to full");
+
+    /* 0 = never */
+    epd4g_set_partials_before_full(0, 0);
+    for (int i = 0; i < 15; i++) {
+        mode_partial = 1; pass_no = 0; expect_fb = a;
+        CHECK(epd4g_partial_rect(a, &r) == EPD4G_OK, "partial with limit 0");
+        mode_partial = 0;
+    }
+    CHECK(epd4g_partials_since_full() == 15 && !epd4g_full_due(), "limit 0 never promotes");
+    CHECK(epd4g_full(a, EPD4G_FULL_FAST) == EPD4G_OK && epd4g_partials_since_full() == 0, "explicit full resets the counter");
+}
+
+static void test_auto_full_bw(void)
+{
+    static uint8_t img[EPD4G_BW_FB_BYTES], img2[EPD4G_BW_FB_BYTES], want[EPD4G_BW_FB_BYTES];
+    epd4g_rect_t r = { 16, 40, 87, 99 };
+    int full0, part0;
+    sim_bw = 1;
+    epd4g_set_partials_before_full(0, 2);
+    CHECK(epd4g_bw_init(EPD4G_BW_NORMAL) == EPD4G_OK, "bw init");
+    bw_random(img);
+    CHECK(epd4g_bw_full(img, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL) == EPD4G_OK && epd4g_partials_since_full() == 0, "bw full");
+    for (int i = 0; i < 2; i++) {
+        bw_random(img2);
+        memcpy(want, img, sizeof want);
+        for (int y = r.y0; y <= r.y1; y++) memcpy(&want[y * 22 + 2], &img2[y * 22 + 2], 9);
+        CHECK(epd4g_bw_partial(img2, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "bw partial %d", i);
+        check_bw_shows(want, "bw partial before the limit");
+        memcpy(img, want, sizeof img);
+    }
+    CHECK(epd4g_partials_since_full() == 2 && epd4g_full_due(), "bw: due after 2 partials");
+
+    /* third request: the whole frame is drawn with a full refresh, not only the window */
+    bw_random(img2);
+    full0 = bw_full_updates; part0 = bw_part_updates;
+    CHECK(epd4g_bw_partial(img2, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "bw promoted partial");
+    CHECK(bw_full_updates == full0 + 1 && bw_part_updates == part0, "one full update, no partial one");
+    check_bw_shows(img2, "bw: whole frame after the promoted full refresh");
+    CHECK(epd4g_partials_since_full() == 0, "bw: counter reset");
+    memcpy(img, img2, sizeof img);
+
+#if EPD4G_BW_PARTIAL_RESET
+    /* after deep sleep: the library runs the init first, then the full refresh */
+    for (int i = 0; i < 2; i++) {
+        bw_random(img2);
+        CHECK(epd4g_bw_partial(img2, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "bw partial");
+        memcpy(want, img, sizeof want);
+        for (int y = r.y0; y <= r.y1; y++) memcpy(&want[y * 22 + 2], &img2[y * 22 + 2], 9);
+        memcpy(img, want, sizeof img);
+    }
+    CHECK(epd4g_sleep() == EPD4G_OK, "bw sleep");
+    bw_random(img2);
+    full0 = bw_full_updates; part0 = bw_part_updates; rst_n = 0;
+    CHECK(epd4g_bw_partial(img2, EPD4G_SRC_1BPP, &r) == EPD4G_OK, "bw promoted partial after sleep");
+    CHECK(bw_full_updates == full0 + 1 && bw_part_updates == part0 && rst_n >= 3, "init + full refresh (resets: %d)", rst_n);
+    check_bw_shows(img2, "bw: frame after sleep + promoted full refresh");
+    CHECK(epd4g_partials_since_full() == 0, "bw: counter reset after sleep case");
+#endif
+    epd4g_set_partials_before_full(0, 0);
+    sim_bw = 0;
+}
+
+#if EPD4G_AUTO_POWEROFF_MS > 0 && EPD4G_KEEP_POWER
+static void test_auto_poweroff(void)
+{
+    static uint8_t fb[EPD4G_FB_BYTES];
+    sim_bw = 0; busy_until = 0; mode_partial = 0;
+    epd4g_fb_fill(fb, EPD4G_WHITE);
+    CHECK(epd4g_init() == EPD4G_OK && epd4g_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "init + full");
+    epd4g_set_done_cb(done_cb, NULL); cb_calls = 0;
+    int res = epd4g_result();
+
+    now_ms += EPD4G_AUTO_POWEROFF_MS / 2;                /* too early */
+    clear_stream();
+    CHECK(epd4g_poll() == 0 && !epd4g_is_busy() && stream_n == 0, "no power-off before the idle time");
+    now_ms += EPD4G_AUTO_POWEROFF_MS;
+    CHECK(epd4g_poll() == EPD4G_PENDING && epd4g_is_busy(), "idle long enough: power-off job starts");
+    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_ERR_BUSY, "the automatic job is a normal job");
+    run_async(NULL, NULL);
+    CHECK(stream_n == 3 && stream[0] == 0x022 && stream[1] == 0x183 && stream[2] == 0x020, "automatic power-off stream");
+    CHECK(cb_calls == 0 && epd4g_result() == res, "the automatic job is silent");
+    now_ms += 10 * EPD4G_AUTO_POWEROFF_MS; clear_stream();
+    CHECK(epd4g_poll() == 0 && stream_n == 0, "only once");
+    epd4g_set_done_cb(NULL, NULL);
+
+    /* the next update powers the panel up again and works as usual */
+    CHECK(epd4g_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "full after the automatic power-off");
+}
+#endif
+
+/* ===== fb helpers: byte-wise versions against the obvious per-pixel ones ===== */
+static void test_fb_fast_helpers(void)
+{
+    static uint8_t m1[EPD4G_MASK_BYTES], m2[EPD4G_MASK_BYTES], g4[EPD4G_FB_BYTES], bw[EPD4G_BW_FB_BYTES];
+    for (int it = 0; it < 3000; it++) {
+        epd4g_rect_t r;
+        r.x0 = (int)(rnd() % 220) - 20; r.x1 = r.x0 + (int)(rnd() % 120) - 10;
+        r.y0 = (int)(rnd() % 300) - 20; r.y1 = r.y0 + (int)(rnd() % 80) - 10;
+        epd4g_mask_clear(m1); epd4g_mask_clear(m2);
+        epd4g_mask_set_rect(m1, &r);
+        for (int y = r.y0; y <= r.y1; y++) for (int x = r.x0; x <= r.x1; x++) epd4g_mask_set(m2, x, y);
+        if (memcmp(m1, m2, sizeof m1) != 0) { CHECK(0, "mask_set_rect differs for %d,%d..%d,%d", r.x0, r.y0, r.x1, r.y1); break; }
+    }
+    random_fb(g4);
+    epd4g_fb_to_bw(bw, g4);
+    for (int y = 0; y < NAT_H; y++) for (int x = 0; x < NAT_W; x++)
+        if (epd4g_bw_fb_get(bw, x, y) != (epd4g_fb_get(g4, x, y) >= EPD4G_BW_THRESHOLD)) { CHECK(0, "fb_to_bw differs at %d,%d", x, y); return; }
+}
+
 int main(void)
 {
+    epd4g_set_partials_before_full(0, 0);   /* the ink / RAM models below check every partial update; promotion has its own tests */
     test_init_matches_stock();
     test_full_deep_matches_stock();
     test_full_fast();
@@ -860,6 +1070,13 @@ int main(void)
     test_bw_cursor_walk();
     test_bw_modes_and_errors();
     test_async();
+    test_noop_jobs();
+    test_auto_full_gray();
+    test_auto_full_bw();
+    test_fb_fast_helpers();
+#if EPD4G_AUTO_POWEROFF_MS > 0 && EPD4G_KEEP_POWER
+    test_auto_poweroff();
+#endif
     printf("epd4g host tests: %d display updates simulated, %s (%d failure%s)\n",
            updates_seen, errors ? "FAILED" : "all passed", errors, errors == 1 ? "" : "s");
     return errors ? 1 : 0;

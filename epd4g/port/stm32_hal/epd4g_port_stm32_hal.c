@@ -38,7 +38,9 @@
 #define EPD4G_BUSY_PIN         EINK_BUSY_Pin
 #endif
 #ifndef EPD4G_SPI_TIMEOUT_MS
-#define EPD4G_SPI_TIMEOUT_MS   1000U
+/* The longest single transfer is the 153-byte LUT (~0.15 ms at 8 MHz). A short timeout keeps the main
+ * loop alive if SPI hangs: HAL_SPI_Transmit() blocks for at most this long. */
+#define EPD4G_SPI_TIMEOUT_MS   20U
 #endif
 
 extern SPI_HandleTypeDef EPD4G_SPI_HANDLE;

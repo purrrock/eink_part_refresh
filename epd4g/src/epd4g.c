@@ -94,7 +94,7 @@ static const uint8_t lut_stock[159] = {
 /* ---------------------------- driver state ------------------------------- */
 enum { MODE_NONE = 0, MODE_GRAY, MODE_BW };
 enum { JOB_NONE = 0, JOB_INIT, JOB_FULL, JOB_PARTIAL, JOB_BW_INIT, JOB_BW_FULL, JOB_BW_PARTIAL,
-       JOB_POWER_OFF, JOB_SLEEP };
+       JOB_POWER_OFF, JOB_SLEEP, JOB_NOP };
 
 static uint8_t s_mode;        /* MODE_xxx: set when an init job has finished, cleared by a timeout / sleep */
 static uint8_t s_io_err;      /* sticky: an SPI write failed during the current job */
@@ -107,12 +107,20 @@ static uint8_t s_asleep;      /* 1-bit: deep sleep entered; RAM planes kept, a p
 static uint8_t s_data;        /* the running job may still read the caller's buffers */
 static uint8_t s_waiting;     /* the last poll stopped on a timer / BUSY wait (not on a data slice) */
 static int     s_result;      /* status of the last finished job */
+static uint16_t s_parts;      /* partial updates since the last full refresh (both modes, saturating) */
+static uint16_t s_n_gray = EPD4G_PARTIALS_BEFORE_FULL;      /* limits, 0 = no automatic full refresh */
+static uint16_t s_n_bw   = EPD4G_BW_PARTIALS_BEFORE_FULL;
+#if EPD4G_AUTO_POWEROFF_MS > 0
+static uint32_t s_idle_t0;    /* tick of the last finished job */
+#endif
 static epd4g_done_cb_t s_cb;
 static void   *s_cb_ctx;
 
 /* The running job. Everything a job needs after a yield lives here, locals do not survive. */
 static struct {
     uint8_t  kind;            /* JOB_xxx */
+    uint8_t  next;            /* JOB_xxx started when this one finishes with EPD4G_OK (chain), JOB_NONE = none */
+    uint8_t  is_auto;         /* started by the library itself (auto power-off): silent */
     uint16_t pc;              /* coroutine resume point */
     int      rc;              /* result */
     uint32_t t0;              /* start of the current wait */
@@ -508,6 +516,7 @@ static int job_full(void)
     s_powered = EPD4G_KEEP_POWER;
     WAIT_BUSY("full refresh");
     PROF(wait1);
+    s_parts = 0;
     CR_END;
 }
 
@@ -560,12 +569,14 @@ static int job_power_off(void)
 static int job_sleep(void)
 {
     CR_BEGIN
-    if ((s_mode == MODE_GRAY ? EPD4G_KEEP_POWER : EPD4G_BW_KEEP_POWER) || s_powered) {
+    if (s_powered) {                              /* s_powered is exact: nothing to switch off otherwise */
         g_trigger(0x83);
         WAIT_BUSY("power off");
     }
     g_cmd(0x10);
-    g_data(0x01);                                 /* deep sleep mode 1; RAM is lost, init to wake */
+    g_data(0x01);                                 /* deep sleep mode 1 (stock Sleep). Whether the RAM survives it is
+                                                   * panel dependent: the 4-gray mode does not rely on it (init to wake);
+                                                   * the 1-bit mode does (see s_asleep), not yet verified on hardware */
     s_powered = 0;
     if (s_mode == MODE_BW) {
         s_asleep = 1;                             /* RAM planes stay valid: partial updates can continue */
@@ -635,6 +646,7 @@ static int job_bw_full(void)
     s_powered = EPD4G_BW_KEEP_POWER;
     WAIT_BUSY("bw full");
     s_base = 1;
+    s_parts = 0;
     if (J.bwmode != EPD4G_BW_FAST) s_fast_lut = 0;      /* 0xF7 reloaded the normal waveform */
     CR_END;
 }
@@ -685,25 +697,60 @@ static int job_run(void)
     case JOB_BW_PARTIAL: return job_bw_partial();
     case JOB_POWER_OFF:  return job_power_off();
     case JOB_SLEEP:      return job_sleep();
+    case JOB_NOP:        return 0;                 /* nothing to do: finishes (result, callback) in this poll */
     default:             return 0;
     }
 }
+
+#if EPD4G_AUTO_POWEROFF_MS > 0
+/* Idle with the analog part on for long enough: queue a silent power-off job. */
+static int auto_poweroff_start(void)
+{
+    if (!s_powered || s_asleep || s_mode == MODE_NONE)
+        return 0;
+    if (!elapsed(s_idle_t0, EPD4G_AUTO_POWEROFF_MS))
+        return 0;
+    J.kind = JOB_POWER_OFF; J.next = JOB_NONE; J.is_auto = 1;
+    J.pc = 0; J.rc = EPD4G_OK;
+    s_io_err = 0; s_data = 0;
+    return 1;
+}
+#endif
 
 int epd4g_poll(void)
 {
     int rc;
 
-    if (J.kind == JOB_NONE)
+    if (J.kind == JOB_NONE) {
+#if EPD4G_AUTO_POWEROFF_MS > 0
+        if (!auto_poweroff_start())
+            return 0;
+#else
         return 0;
+#endif
+    }
     s_waiting = 0;
     if (job_run() != 0)
         return EPD4G_PENDING;
 
     rc = finish(J.rc);
-    s_result = rc;
+    if (rc == EPD4G_OK && J.next != JOB_NONE) {    /* chained job (e.g. init before an automatic full refresh) */
+        J.kind = J.next; J.next = JOB_NONE;
+        J.pc = 0; J.rc = EPD4G_OK;
+        return EPD4G_PENDING;
+    }
+    J.next = JOB_NONE;
     s_data = 0;
     J.kind = JOB_NONE;
     J.pc = 0;
+#if EPD4G_AUTO_POWEROFF_MS > 0
+    s_idle_t0 = epd4g_port_tick_ms();
+#endif
+    if (J.is_auto) {                               /* the library's own job: the application never asked for it */
+        J.is_auto = 0;
+        return 0;
+    }
+    s_result = rc;
     if (s_cb != NULL)
         s_cb(rc, s_cb_ctx);
     return 0;
@@ -727,6 +774,8 @@ void epd4g_abort(void)
 {
     J.kind = JOB_NONE;
     J.pc = 0;
+    J.next = JOB_NONE;
+    J.is_auto = 0;
     s_mode = MODE_NONE;
     s_asleep = 0;
     s_powered = 0;
@@ -740,6 +789,8 @@ static int job_start(uint8_t kind)
     if (J.kind != JOB_NONE)
         return EPD4G_ERR_BUSY;
     J.kind = kind;
+    J.next = JOB_NONE;
+    J.is_auto = 0;
     J.pc = 0;
     J.rc = EPD4G_OK;
     s_io_err = 0;
@@ -751,6 +802,37 @@ static int need_mode(uint8_t mode)
     if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
     if (s_mode != mode)      return EPD4G_ERR_MODE;
     return EPD4G_OK;
+}
+
+int epd4g_gray_ready(void)
+{
+    return need_mode(MODE_GRAY);
+}
+
+int epd4g_start_noop(void)
+{
+    int rc = job_start(JOB_NOP);
+    if (rc != EPD4G_OK) return rc;
+    s_data = 0;
+    return EPD4G_OK;
+}
+
+void epd4g_set_partials_before_full(unsigned gray, unsigned bw)
+{
+    s_n_gray = (uint16_t)(gray > 0xFFFFu ? 0xFFFFu : gray);
+    s_n_bw   = (uint16_t)(bw   > 0xFFFFu ? 0xFFFFu : bw);
+}
+
+unsigned epd4g_partials_since_full(void)
+{
+    return s_parts;
+}
+
+int epd4g_full_due(void)
+{
+    if (s_mode == MODE_GRAY) return s_n_gray != 0 && s_parts >= s_n_gray;
+    if (s_mode == MODE_BW)   return s_n_bw   != 0 && s_parts >= s_n_bw;
+    return 0;
 }
 
 int epd4g_start_init(void)
@@ -780,7 +862,13 @@ int epd4g_start_partial(const uint8_t *fb, const uint8_t *mask)
     if (fb == NULL || mask == NULL) return EPD4G_ERR_PARAM;
     if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
     if ((rc = need_mode(MODE_GRAY)) != EPD4G_OK) return rc;
+    if (s_n_gray != 0 && s_parts >= s_n_gray) {                 /* limit reached: redraw everything instead */
+        job_start(JOB_FULL); s_data = 1;
+        J.fb = fb; J.mask = NULL; J.fullmode = (uint8_t)EPD4G_AUTO_FULL_MODE;
+        return EPD4G_OK;
+    }
     job_start(JOB_PARTIAL); s_data = 1;
+    if (s_parts < 0xFFFFu) s_parts++;
     J.fb = fb; J.mask = mask;
     return EPD4G_OK;
 }
@@ -789,7 +877,8 @@ int epd4g_start_power_off(void)
 {
     if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
     if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
-    if (s_asleep) { s_result = EPD4G_OK; return EPD4G_OK; }     /* already off */
+    if (s_asleep || !s_powered)                                /* nothing to switch off: a no-op job */
+        return epd4g_start_noop();
     return job_start(JOB_POWER_OFF);
 }
 
@@ -797,7 +886,8 @@ int epd4g_start_sleep(void)
 {
     if (J.kind != JOB_NONE) return EPD4G_ERR_BUSY;
     if (s_mode == MODE_NONE) return EPD4G_ERR_NOT_INIT;
-    if (s_asleep) { s_result = EPD4G_OK; return EPD4G_OK; }     /* already asleep: nothing to do */
+    if (s_asleep)                                              /* already asleep: a no-op job */
+        return epd4g_start_noop();
     return job_start(JOB_SLEEP);
 }
 
@@ -847,7 +937,19 @@ int epd4g_start_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t 
     if ((rc = need_mode(MODE_BW)) != EPD4G_OK) return rc;
     if (s_asleep && !EPD4G_BW_PARTIAL_RESET) return EPD4G_ERR_NOT_INIT;   /* no reset -> nothing wakes the panel */
     if (!s_base) return EPD4G_ERR_NO_BASE;
+    if (s_n_bw != 0 && s_parts >= s_n_bw) {                     /* limit reached: full refresh of the same frame */
+        if (s_asleep) {                                         /* a full refresh needs the init the sleep took away */
+            job_start(JOB_BW_INIT); J.next = JOB_BW_FULL;
+            s_mode = MODE_NONE; tables_init();
+        } else {
+            job_start(JOB_BW_FULL);
+        }
+        s_data = (src != EPD4G_SRC_WHITE);
+        J.img = img; J.src = (uint8_t)src; J.bwmode = (uint8_t)EPD4G_BW_NORMAL;
+        return EPD4G_OK;
+    }
     job_start(JOB_BW_PARTIAL); s_data = (src != EPD4G_SRC_WHITE);
+    if (s_parts < 0xFFFFu) s_parts++;
     J.img = img; J.src = (uint8_t)src;
     J.xb0 = x0 >> 3; J.xb1 = x1 >> 3; J.y0 = y0; J.y1 = y1;
     return EPD4G_OK;

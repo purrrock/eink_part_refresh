@@ -120,9 +120,22 @@ void epd4g_mask_set_rect(uint8_t *mask, const epd4g_rect_t *r)
 {
     int x0 = r->x0 < 0 ? 0 : r->x0, x1 = r->x1 >= EPD4G_WIDTH ? EPD4G_WIDTH - 1 : r->x1;
     int y0 = r->y0 < 0 ? 0 : r->y0, y1 = r->y1 >= EPD4G_HEIGHT ? EPD4G_HEIGHT - 1 : r->y1;
-    for (int y = y0; y <= y1; y++)
-        for (int x = x0; x <= x1; x++)
-            epd4g_mask_set(mask, x, y);
+    if (x0 > x1 || y0 > y1)
+        return;
+    const int b0 = x0 >> 3, b1 = x1 >> 3;
+    const uint8_t left  = (uint8_t)(0xFFu >> (x0 & 7));            /* bits x0 .. end of its byte */
+    const uint8_t right = (uint8_t)(0xFFu << (7 - (x1 & 7)));      /* start of its byte .. x1    */
+    for (int y = y0; y <= y1; y++) {
+        uint8_t *row = mask + (size_t)y * EPD4G_MASK_STRIDE;
+        if (b0 == b1) {
+            row[b0] |= (uint8_t)(left & right);
+        } else {
+            row[b0] |= left;
+            for (int b = b0 + 1; b < b1; b++)
+                row[b] = 0xFF;
+            row[b1] |= right;
+        }
+    }
 }
 
 uint32_t epd4g_mask_from_diff(uint8_t *mask, const uint8_t *prev, const uint8_t *cur,
@@ -171,21 +184,26 @@ int epd4g_start_partial_diff(const uint8_t *prev, const uint8_t *cur,
                              const epd4g_rect_t *roi, uint32_t *changed)
 {
     uint32_t n;
+    int rc;
 
     if (prev == NULL || cur == NULL)
         return EPD4G_ERR_PARAM;
     if (epd4g_is_busy())
         return EPD4G_ERR_BUSY;
+    if ((rc = epd4g_gray_ready()) != EPD4G_OK)       /* before the (relatively slow) mask is built */
+        return rc;
     n = epd4g_mask_from_diff(s_mask, prev, cur, roi);
     if (changed != NULL)
         *changed = n;
     if (n == 0)
-        return EPD4G_OK;
+        return epd4g_start_noop();                   /* nothing to draw; finishes in the next poll */
     return epd4g_start_partial(cur, s_mask);
 }
 
 int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
 {
+    int rc;
+
     if (fb == NULL || rect == NULL)
         return EPD4G_ERR_PARAM;
     if (rect->x0 > rect->x1 || rect->y0 > rect->y1 ||
@@ -193,6 +211,8 @@ int epd4g_start_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
         return EPD4G_ERR_PARAM;
     if (epd4g_is_busy())
         return EPD4G_ERR_BUSY;
+    if ((rc = epd4g_gray_ready()) != EPD4G_OK)
+        return rc;
     epd4g_mask_clear(s_mask);
     epd4g_mask_set_rect(s_mask, rect);
     return epd4g_start_partial(fb, s_mask);
@@ -202,9 +222,7 @@ int epd4g_partial_diff(const uint8_t *prev, const uint8_t *cur,
                        const epd4g_rect_t *roi, uint32_t *changed)
 {
     int rc = epd4g_start_partial_diff(prev, cur, roi, changed);
-    if (rc != EPD4G_OK || !epd4g_is_busy())
-        return rc;                                  /* error, or nothing changed */
-    return epd4g_wait();
+    return rc != EPD4G_OK ? rc : epd4g_wait();      /* nothing changed: a no-op job, wait() returns at once */
 }
 
 int epd4g_partial_rect(const uint8_t *fb, const epd4g_rect_t *rect)
@@ -263,16 +281,21 @@ void epd4g_bw_fb_copy_rect(uint8_t *dst, const uint8_t *src, const epd4g_rect_t 
     }
 }
 
+/* 4 pixels of a 2-bit image byte -> 4 bits (first pixel in bit 3), 1 = pixel >= EPD4G_BW_THRESHOLD */
+static uint8_t nibble_bw(uint8_t b)
+{
+    return (uint8_t)((((b >> 6) & 3) >= EPD4G_BW_THRESHOLD ? 8 : 0) |
+                     (((b >> 4) & 3) >= EPD4G_BW_THRESHOLD ? 4 : 0) |
+                     (((b >> 2) & 3) >= EPD4G_BW_THRESHOLD ? 2 : 0) |
+                     ((b & 3)        >= EPD4G_BW_THRESHOLD ? 1 : 0));
+}
+
 void epd4g_fb_to_bw(uint8_t *bw, const uint8_t *fb)
 {
-    for (int y = 0; y < EPD4G_HEIGHT; y++)
-        for (int xb = 0; xb < EPD4G_BW_STRIDE; xb++) {
-            uint8_t v = 0;
-            for (int k = 0; k < 8; k++) {
-                int x = xb * 8 + k;
-                if (epd4g_fb_get(fb, x, y) >= EPD4G_BW_THRESHOLD)
-                    v |= (uint8_t)(0x80u >> k);
-            }
-            bw[(size_t)y * EPD4G_BW_STRIDE + (size_t)xb] = v;
-        }
+    for (int y = 0; y < EPD4G_HEIGHT; y++) {
+        const uint8_t *in = fb + (size_t)y * EPD4G_FB_STRIDE;
+        uint8_t *out = bw + (size_t)y * EPD4G_BW_STRIDE;
+        for (int xb = 0; xb < EPD4G_BW_STRIDE; xb++)       /* 2 image bytes = 8 pixels = 1 plane byte */
+            out[xb] = (uint8_t)((nibble_bw(in[xb * 2]) << 4) | nibble_bw(in[xb * 2 + 1]));
+    }
 }
