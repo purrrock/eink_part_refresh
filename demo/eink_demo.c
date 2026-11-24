@@ -403,6 +403,15 @@ int eink_demo_task(void)
     return start_next();
 }
 
+uint32_t eink_demo_wait_ms(int *on_busy)
+{
+    if (on_busy != NULL)
+        *on_busy = 0;
+    if (!epd4g_is_busy())                   /* задачи нет: следующий eink_demo_task() запустит новую */
+        return 0;
+    return epd4g_wait_hint(on_busy);        /* идущая задача не вернёт EPD4G_WAIT_FOREVER */
+}
+
 uint32_t eink_demo_last_update_ms(void)
 {
     return s_last_ms;

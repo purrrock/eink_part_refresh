@@ -12,6 +12,13 @@ int eink_demo_init(void);
 /* Returns 0 on success, -1 on a display/SPI/BUSY error. */
 int eink_demo_task(void);
 
+/* Для низкого энергопотребления: сколько мс главный цикл может спать до следующего eink_demo_task()
+ * (подсказка epd4g_wait_hint()). Вызывать сразу после eink_demo_task().
+ *   0     - вызвать eink_demo_task() сейчас (идёт передача данных по SPI, ожидание закончилось);
+ *   N > 0 - можно спать до N мс; *on_busy (может быть NULL) = 1, если задача ждёт BUSY панели:
+ *           тогда можно проснуться раньше, по спаду BUSY (PB2). Ранний подъём безвреден. */
+uint32_t eink_demo_wait_ms(int *on_busy);
+
 /* Длительность последнего обновления (мс) — удобно смотреть в отладчике. */
 uint32_t eink_demo_last_update_ms(void);
 

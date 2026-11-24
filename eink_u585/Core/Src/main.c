@@ -27,9 +27,13 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "eink_demo.h"
+#include "eink_sleep.h"   /* сон по epd4g_wait_hint(): TIM6 + EXTI2 (BUSY), без изменений CubeMX */
 #include "debug_uart.h"   /* выбор USART консоли: EINK_DEBUG_USART (1 или 2) */
 #ifndef EINK_DIAG
 #define EINK_DIAG 1     /* 1 = журнал в отладочный USART (printf), см. CMakeLists.txt */
+#endif
+#ifndef EINK_SLEEP
+#define EINK_SLEEP 1    /* 1 = между опросами epd4g спать (Sleep), 0 = крутить цикл без сна */
 #endif
 /* USER CODE END Includes */
 
@@ -108,6 +112,9 @@ int main(void)
   printf("[BOOT] EINK_BUSY PB2 level before panel init: %u\r\n",
          (unsigned)HAL_GPIO_ReadPin(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin));
 #endif
+#if EINK_SLEEP
+  eink_sleep_init();
+#endif
   if (eink_demo_init() != 0) {
 #if EINK_DIAG
     printf("[FATAL] eink_demo_init failed; animation stopped\r\n");
@@ -130,6 +137,16 @@ int main(void)
 #endif
         while (1) { HAL_Delay(1000); }
       }
+#if EINK_SLEEP
+      /* Панель рисует секунды: спим ровно столько, сколько говорит epd4g_wait_hint(); будит таймер
+       * или спад BUSY. Здесь же, перед сном, обработайте GNSS и кнопки (сон только если они молчат). */
+      {
+          int on_busy = 0;
+          const uint32_t ms = eink_demo_wait_ms(&on_busy);
+          if (ms != 0U)
+              (void)eink_sleep(ms, on_busy);
+      }
+#endif
   }
   /* USER CODE END 3 */
 }

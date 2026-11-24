@@ -51,6 +51,7 @@ option(EINK_DIAG    "Печатать журнал демо в отладочн�
 # Номер USART отладочной консоли: 1 = USART1 (PA9/PA10), 2 = USART2 (PA2/PA3)
 set(EINK_DEBUG_USART "1" CACHE STRING "Номер USART для отладочной консоли (1 или 2)")
 set_property(CACHE EINK_DEBUG_USART PROPERTY STRINGS 1 2)
+option(EINK_SLEEP   "Между опросами epd4g спать в Sleep по подсказке epd4g_wait_hint() (TIM6 + EXTI2 по BUSY)" ON)
 option(EINK_PROFILE "Печатать время по фазам каждого обновления (нужен EINK_DIAG)" OFF)
 
 set(EPD4G_PROFILE ${EINK_PROFILE})          # передаём опцию библиотеке
@@ -61,6 +62,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../epd4g epd4g)
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_LIST_DIR}/../demo/eink_demo.c
+    Core/Src/eink_sleep.c
 )
 
 # Add include paths
@@ -76,6 +78,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
     EINK_DIAG=$<BOOL:${EINK_DIAG}>
     EINK_PROFILE=$<BOOL:${EINK_PROFILE}>
+    EINK_SLEEP=$<BOOL:${EINK_SLEEP}>
     EINK_DEBUG_USART=${EINK_DEBUG_USART}
     # Настройки библиотеки (все необязательные, значения по умолчанию - в epd4g/include/epd4g_config.h):
     # EPD4G_KEEP_POWER=0
