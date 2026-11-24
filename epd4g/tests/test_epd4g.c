@@ -1034,6 +1034,66 @@ static void test_auto_poweroff(void)
 }
 #endif
 
+/* ===== epd4g_wait_hint(): sleeping as the hint says gives the same picture with few polls ===== */
+static void run_hinted(long *polls, long *timer_waits, long *busy_waits)
+{
+    *polls = *timer_waits = *busy_waits = 0;
+    for (;;) {
+        int ob = -1;
+        epd4g_poll(); (*polls)++;
+        if (!epd4g_is_busy()) break;
+        uint32_t h = epd4g_wait_hint(&ob);
+        CHECK(h != EPD4G_WAIT_FOREVER, "a running job never reports FOREVER");
+        if (h == 0) {
+            /* SPI data slice or a wait that is over: poll again at once */
+        } else if (ob == 1) {
+            CHECK(epd4g_port_gpio_busy() == 1, "BUSY wait is reported only while BUSY is high");
+            (*busy_waits)++;
+            if (now_ms < busy_until) now_ms = busy_until;      /* woken by the falling edge of BUSY */
+            else now_ms += h;
+        } else {
+            CHECK(ob == 0, "on_busy is 0 for a timer wait");
+            (*timer_waits)++;
+            now_ms += h;                                        /* slept for the whole hint */
+        }
+        if (*polls > 100000) { CHECK(0, "wait_hint loop does not converge"); break; }
+    }
+}
+
+static void test_wait_hint(void)
+{
+    static uint8_t fb[EPD4G_FB_BYTES];
+    long polls, tw, bw;
+    int ob = -1;
+    uint32_t h;
+
+    sim_bw = 0; busy_until = 0; mode_partial = 0;
+    random_fb(fb);
+
+    h = epd4g_wait_hint(&ob);                    /* no job: forever, or the automatic power-off delay */
+    CHECK((h == EPD4G_WAIT_FOREVER || h > 0 || EPD4G_AUTO_POWEROFF_MS > 0) && ob == 0, "idle hint");
+
+    CHECK(epd4g_start_init() == EPD4G_OK, "start init");
+    CHECK(epd4g_wait_hint(&ob) == 0, "a job that has not run yet: poll at once");
+    run_hinted(&polls, &tw, &bw);
+    CHECK(epd4g_result() == EPD4G_OK, "hinted init result %d", epd4g_result());
+    CHECK(tw >= 1, "init waits on timers: %ld (on BUSY: %ld)", tw, bw);
+
+    CHECK(epd4g_start_full(fb, EPD4G_FULL_FAST) == EPD4G_OK, "start full");
+    run_hinted(&polls, &tw, &bw);
+    CHECK(epd4g_result() == EPD4G_OK, "hinted full result %d", epd4g_result());
+    check_ink_equals(fb, "hinted full");
+    CHECK(bw >= 1, "the waveform is waited for on BUSY (%ld)", bw);
+    CHECK(polls < 2000, "hinted full needed %ld polls (a 1 ms polling loop needs thousands)", polls);
+
+    /* BUSY already low: the hint says poll now rather than sleep */
+    busy_until = 0;
+    h = epd4g_wait_hint(&ob);
+    CHECK(h == EPD4G_WAIT_FOREVER || h > 0 || EPD4G_AUTO_POWEROFF_MS > 0, "idle after the job");
+    CHECK(epd4g_start_noop() == EPD4G_OK && epd4g_wait_hint(&ob) == 0, "noop job: poll at once");
+    run_hinted(&polls, &tw, &bw);
+}
+
 /* ===== fb helpers: byte-wise versions against the obvious per-pixel ones ===== */
 static void test_fb_fast_helpers(void)
 {
@@ -1070,6 +1130,7 @@ int main(void)
     test_bw_cursor_walk();
     test_bw_modes_and_errors();
     test_async();
+    test_wait_hint();
     test_noop_jobs();
     test_auto_full_gray();
     test_auto_full_bw();

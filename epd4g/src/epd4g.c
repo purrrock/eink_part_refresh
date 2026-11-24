@@ -106,6 +106,8 @@ static uint8_t s_fast_lut;    /* 1-bit: the Init_Fast waveform is loaded (EPD4G_
 static uint8_t s_asleep;      /* 1-bit: deep sleep entered; RAM planes kept, a partial update wakes the panel by its reset */
 static uint8_t s_data;        /* the running job may still read the caller's buffers */
 static uint8_t s_waiting;     /* the last poll stopped on a timer / BUSY wait (not on a data slice) */
+static uint8_t s_wait_kind;   /* what it waits for: WAIT_KIND_* (valid while s_waiting) */
+static uint32_t s_wait_ms;    /* WAIT_KIND_TIMER: length of the wait that started at J.t0 */
 static int     s_result;      /* status of the last finished job */
 static uint16_t s_parts;      /* partial updates since the last full refresh (both modes, saturating) */
 static uint16_t s_n_gray = EPD4G_PARTIALS_BEFORE_FULL;      /* limits, 0 = no automatic full refresh */
@@ -185,11 +187,14 @@ static void g_burst_end(void)
  * macros sit on one source line. A job function returns 1 (pending) or 0 (finished, result in J.rc). */
 #define CR_BEGIN        switch (J.pc) { case 0:
 #define CR_END          } J.pc = 0; return 0
-#define CR_WAIT_N(cond, wait, n) \
+#define WAIT_KIND_UNKNOWN 0     /* epd4g_wait_hint(): poll again at once */
+#define WAIT_KIND_TIMER   1     /* J.t0 + s_wait_ms */
+#define WAIT_KIND_BUSY    2     /* BUSY pin, timeout EPD4G_BUSY_TIMEOUT_MS from J.t0 */
+#define CR_WAIT_N(cond, wait, kind, n) \
     do { J.pc = (uint16_t)((n) + 1); /* fallthrough */ case (n) + 1: \
-         if (!(cond)) { s_waiting = (wait); return 1; } } while (0)
-#define CR_WAIT(cond)   CR_WAIT_N(cond, 1, __COUNTER__)    /* timer / BUSY: sleep a bit */
-#define CR_SLICE(cond)  CR_WAIT_N(cond, 0, __COUNTER__)    /* more data to send: come back at once */
+         if (!(cond)) { s_waiting = (wait); s_wait_kind = (kind); return 1; } } while (0)
+#define CR_WAIT(cond)   CR_WAIT_N(cond, 1, WAIT_KIND_UNKNOWN, __COUNTER__)    /* timer / BUSY: sleep a bit */
+#define CR_SLICE(cond)  CR_WAIT_N(cond, 0, WAIT_KIND_UNKNOWN, __COUNTER__)    /* more data to send: come back at once */
 #define FAIL(code)      do { J.rc = (code); J.pc = 0; return 0; } while (0)
 
 static int elapsed(uint32_t t0, uint32_t ms)
@@ -197,7 +202,8 @@ static int elapsed(uint32_t t0, uint32_t ms)
     return (uint32_t)(epd4g_port_tick_ms() - t0) >= ms;
 }
 
-#define WAIT_MS(ms)     do { J.t0 = epd4g_port_tick_ms(); CR_WAIT(elapsed(J.t0, (ms))); } while (0)
+#define WAIT_MS(ms)     do { J.t0 = epd4g_port_tick_ms(); s_wait_ms = (ms); \
+                             CR_WAIT_N(elapsed(J.t0, s_wait_ms), 1, WAIT_KIND_TIMER, __COUNTER__); } while (0)
 
 /* 0 = still busy, 1 = ready, -1 = timeout (the panel is then considered uninitialised) */
 static int busy_poll(uint32_t t0, const char *where)
@@ -217,7 +223,7 @@ static int busy_poll(uint32_t t0, const char *where)
 /* wait for BUSY low, then the settle pause (stock Waveshare code uses 20 ms) */
 #define WAIT_BUSY(where) \
     do { J.t0 = epd4g_port_tick_ms(); \
-         CR_WAIT((J.bs = busy_poll(J.t0, (where))) != 0); \
+         CR_WAIT_N((J.bs = busy_poll(J.t0, (where))) != 0, 1, WAIT_KIND_BUSY, __COUNTER__); \
          if (J.bs < 0) FAIL(EPD4G_ERR_TIMEOUT); \
          if (EPD4G_BUSY_SETTLE_MS > 0) WAIT_MS(EPD4G_BUSY_SETTLE_MS); } while (0)
 
@@ -712,7 +718,7 @@ static int auto_poweroff_start(void)
         return 0;
     J.kind = JOB_POWER_OFF; J.next = JOB_NONE; J.is_auto = 1;
     J.pc = 0; J.rc = EPD4G_OK;
-    s_io_err = 0; s_data = 0;
+    s_io_err = 0; s_data = 0; s_waiting = 0;
     return 1;
 }
 #endif
@@ -737,6 +743,7 @@ int epd4g_poll(void)
     if (rc == EPD4G_OK && J.next != JOB_NONE) {    /* chained job (e.g. init before an automatic full refresh) */
         J.kind = J.next; J.next = JOB_NONE;
         J.pc = 0; J.rc = EPD4G_OK;
+        s_waiting = 0;
         return EPD4G_PENDING;
     }
     J.next = JOB_NONE;
@@ -770,6 +777,42 @@ int epd4g_wait(void)
     return s_result;
 }
 
+/* Time left of a wait that began at t0 and lasts ms; 0 = over. */
+static uint32_t wait_left(uint32_t t0, uint32_t ms)
+{
+    const uint32_t used = (uint32_t)(epd4g_port_tick_ms() - t0);
+    return (used >= ms) ? 0U : (ms - used);
+}
+
+uint32_t epd4g_wait_hint(int *on_busy)
+{
+    if (on_busy != NULL)
+        *on_busy = 0;
+
+    if (J.kind == JOB_NONE) {
+#if EPD4G_AUTO_POWEROFF_MS > 0
+        if (s_powered && !s_asleep && s_mode != MODE_NONE)
+            return wait_left(s_idle_t0, EPD4G_AUTO_POWEROFF_MS);
+#endif
+        return EPD4G_WAIT_FOREVER;
+    }
+    if (!s_waiting)                                  /* data slice or a job that has not run yet */
+        return 0;
+
+    switch (s_wait_kind) {
+    case WAIT_KIND_TIMER:
+        return wait_left(J.t0, s_wait_ms);
+    case WAIT_KIND_BUSY:
+        if (epd4g_port_gpio_busy() == 0)             /* already ready: the next poll moves on */
+            return 0;
+        if (on_busy != NULL)
+            *on_busy = 1;
+        return wait_left(J.t0, EPD4G_BUSY_TIMEOUT_MS);
+    default:
+        return 0;
+    }
+}
+
 void epd4g_abort(void)
 {
     J.kind = JOB_NONE;
@@ -781,6 +824,7 @@ void epd4g_abort(void)
     s_powered = 0;
     s_data = 0;
     s_io_err = 0;
+    s_waiting = 0;
 }
 
 /* ------------------------------ start API -------------------------------- */
@@ -794,6 +838,7 @@ static int job_start(uint8_t kind)
     J.pc = 0;
     J.rc = EPD4G_OK;
     s_io_err = 0;
+    s_waiting = 0;
     return EPD4G_OK;
 }
 

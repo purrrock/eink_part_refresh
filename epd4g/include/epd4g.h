@@ -171,6 +171,22 @@ int epd4g_gray_ready(void);
  *  a call takes about a millisecond at most. The outcome of a finished job is epd4g_result(). */
 int epd4g_poll(void);
 
+/** Returned by epd4g_wait_hint() when nothing is pending: no job and no automatic power-off to wait for. */
+#define EPD4G_WAIT_FOREVER 0xFFFFFFFFu
+
+/** For low-power callers: how long the application may leave the MCU asleep before the next
+ *  epd4g_poll() is useful. Call it right after epd4g_poll() (or after a start function).
+ *  Returns
+ *    0                   poll again now (SPI data is being sent, a wait is over, or the state is unknown);
+ *    EPD4G_WAIT_FOREVER  nothing to do: no job and no automatic power-off pending;
+ *    N > 0               the next poll can only make progress after N ms (a timer wait, the BUSY timeout
+ *                        or the automatic power-off delay).
+ *  *on_busy (may be NULL) is set to 1 when the job waits for the BUSY pin: then N is the BUSY timeout
+ *  and the application may also wake up on the falling edge of BUSY (BUSY = 1 means busy). With the
+ *  edge wake the settle pause after BUSY (EPD4G_BUSY_SETTLE_MS) is reported by the next call as a timer
+ *  wait. Waking earlier than N is always harmless, only waking later is not. */
+uint32_t epd4g_wait_hint(int *on_busy);
+
 /** 1 while a job is running (between a successful start and the poll that returned 0). */
 int epd4g_is_busy(void);
 
