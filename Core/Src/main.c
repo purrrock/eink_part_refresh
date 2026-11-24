@@ -24,6 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>        /* printf, EOF */
 #include "eink_demo.h"
 #include "debug_uart.h"   /* выбор USART консоли: EINK_DEBUG_USART (1 или 2) */
 #ifndef EINK_DIAG
