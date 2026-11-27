@@ -163,3 +163,14 @@ void eink_sleep_stats(uint32_t *count, uint32_t *total_ms)
     if (total_ms != NULL)
         *total_ms = s_total_ms;
 }
+
+/* Для eink_pwr.c (Stop 2): те же взвод и снятие пробуждения по спаду BUSY. */
+int eink_busy_arm(void)
+{
+    return busy_wake_arm();
+}
+
+void eink_busy_disarm(void)
+{
+    busy_wake_disarm();
+}

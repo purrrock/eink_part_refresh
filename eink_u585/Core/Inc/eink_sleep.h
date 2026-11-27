@@ -33,4 +33,13 @@ uint32_t eink_sleep(uint32_t ms, int on_busy);
 /* Статистика для отладки: число уходов в сон и суммарное время сна, мс. */
 void eink_sleep_stats(uint32_t *count, uint32_t *total_ms);
 
+/*
+ * Пробуждение по спаду BUSY отдельно от eink_sleep() (его использует Stop 2 в eink_pwr.c).
+ * eink_busy_arm(): настроить EXTI2 на спад PB2; 1 - линия взведена и BUSY ещё высокий, 0 - BUSY уже
+ * низкий, спать нельзя. Вызывать при выключенных прерываниях (PRIMASK) прямо перед WFI.
+ * eink_busy_disarm(): снять EXTI2, вернуть PB2 обычным цифровым входом.
+ */
+int eink_busy_arm(void);
+void eink_busy_disarm(void);
+
 #endif /* EINK_SLEEP_H */

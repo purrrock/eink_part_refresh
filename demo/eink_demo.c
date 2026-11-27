@@ -60,6 +60,12 @@
 #define EINK_PROFILE        0
 #endif
 
+/* 1 - сборка теста тока (eink_power_test.c): файл подключается целиком ради рисования карты,
+ * маркёра и трека, а демо-автомат и eink_demo_xxx() исключаются (их заменяет тест). */
+#ifndef EINK_POWER_TEST
+#define EINK_POWER_TEST     0
+#endif
+
 /* Ориентация логического экрана. Старый переключатель EINK_ROTATE_180=1 тоже работает. */
 #ifndef EINK_ROT
 #if defined(EINK_ROTATE_180) && EINK_ROTATE_180
@@ -482,6 +488,8 @@ static epd4g_rect_t rect_around(int cx, int cy)
     return r;
 }
 
+#if !EINK_POWER_TEST
+
 /* ------------------------------ обновление -------------------------------- */
 
 static int full_refresh(void)
@@ -769,3 +777,5 @@ uint32_t eink_demo_last_update_ms(void)
 {
     return s_last_ms;
 }
+
+#endif /* !EINK_POWER_TEST */

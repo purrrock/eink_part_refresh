@@ -54,6 +54,11 @@ set_property(CACHE EINK_DEBUG_USART PROPERTY STRINGS 1 2)
 option(EINK_SLEEP   "Между опросами epd4g спать в Sleep по подсказке epd4g_wait_hint() (TIM6 + EXTI2 по BUSY)" ON)
 option(EINK_PROFILE "Печатать время по фазам каждого обновления (нужен EINK_DIAG)" OFF)
 
+option(EINK_POWER_TEST "Вместо демо собрать тест замера тока мультиметром (demo/eink_power_test.c, см. Docs/POWER_TEST.md)" OFF)
+set(PWR_DWELL_STATIC_S 15 CACHE STRING "Тест тока: секунд на статический режим")
+set(PWR_DWELL_DYN_S    30 CACHE STRING "Тест тока: секунд на динамический режим")
+option(PWR_TEST_BW_KEEP "Тест тока: 1-bit с включённым аналогом (в библиотеке не проверено на железе)" OFF)
+
 set(EPD4G_PROFILE ${EINK_PROFILE})          # передаём опцию библиотеке
 # библиотека лежит в корне репозитория, поэтому нужен второй аргумент (каталог сборки)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../epd4g epd4g)
@@ -61,9 +66,24 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../epd4g epd4g)
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    ${CMAKE_CURRENT_LIST_DIR}/../demo/eink_demo.c
     Core/Src/eink_sleep.c
 )
+if(EINK_POWER_TEST)
+    # eink_power_test.c сам подключает eink_demo.c (рисование карты), отдельно его не компилируем
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/../demo/eink_power_test.c
+        Core/Src/eink_pwr.c
+    )
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        EINK_POWER_TEST=1
+        EPD4G_USER_CONFIG="pwr_epd4g_cfg.h"
+        PWR_DWELL_STATIC_S=${PWR_DWELL_STATIC_S}
+        PWR_DWELL_DYN_S=${PWR_DWELL_DYN_S}
+        PWR_TEST_BW_KEEP=$<BOOL:${PWR_TEST_BW_KEEP}>
+    )
+else()
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../demo/eink_demo.c)
+endif()
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
