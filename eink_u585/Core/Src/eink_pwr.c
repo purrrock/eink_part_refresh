@@ -122,6 +122,38 @@ void pwr_lines_set(pwr_lines_t mode, unsigned flags)
     }
 }
 
+void pwr_pin_set(pwr_pin_t pin, pwr_pinmode_t mode)
+{
+    GPIO_TypeDef *port = NULL, *port2 = NULL;
+    uint32_t pn = 0, pn2 = 0;
+
+    switch (pin) {
+    case PWR_PIN_RST:  port = EINK_RST_GPIO_Port; pn = EINK_RST_Pin; break;
+    case PWR_PIN_CS:   port = EINK_CS_GPIO_Port;  pn = EINK_CS_Pin;  break;
+    case PWR_PIN_DC:   port = EINK_DC_GPIO_Port;  pn = EINK_DC_Pin;  break;
+    case PWR_PIN_SPI:  port = SCK_PORT; pn = SCK_PIN; port2 = MOSI_PORT; pn2 = MOSI_PIN; break;
+    case PWR_PIN_BUSY:
+    default:
+        if (mode == PWR_PIN_ANALOG) {
+            pin_analog(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin);
+            s_busy_off = 1;
+        } else {
+            busy_in();
+            s_busy_off = 0;
+        }
+        return;
+    }
+    if (mode == PWR_PIN_ANALOG) {
+        pin_analog(port, pn);
+        if (port2 != NULL)
+            pin_analog(port2, pn2);
+    } else {
+        pin_out(port, pn, mode == PWR_PIN_HIGH);
+        if (port2 != NULL)
+            pin_out(port2, pn2, mode == PWR_PIN_HIGH);
+    }
+}
+
 /* ---------------------------------- UART ----------------------------------- */
 
 static void uart_flush(UART_HandleTypeDef *h)

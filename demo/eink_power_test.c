@@ -18,8 +18,12 @@
  * стоит в 0 (как сейчас). HIGH - SPI1 выключен, SCK/MOSI/DC = 1. ANALOG - SPI1 выключен, SCK/MOSI/DC
  * в analog (CS и RST остаются выходами: библиотека держит RST низким в импульсе сброса).
  *
+ *   HAT-PWR (PWR_GROUPS & 8) мини-тест «какая линия обесточивает HAT»: панель в power off, Stop 2,
+ *           все линии в 1, а одна из них (RST, CS, BUSY, DC, SCK+MOSI) в 0 или в analog. После замера
+ *           8 с на осмотр экрана (сохранилась ли картинка), затем время повторного init и полного обновления.
+ *
  * Параметры (-D... в CMake): PWR_DWELL_STATIC_S, PWR_DWELL_DYN_S, PWR_ANALOG_ON_MAX_S, PWR_GROUPS (маска:
- * 1 STATIC, 2 DYN-4G, 4 DYN-1B), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
+ * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 HAT-PWR), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
  */
 #define EINK_POWER_TEST 1
 #include "eink_demo.c"
@@ -55,7 +59,7 @@ volatile unsigned char g_pwr_keep_gray = 1;     /* см. pwr_epd4g_cfg.h */
 
 /* ------------------------------ список шагов ------------------------------- */
 
-enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW };
+enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW, GRP_HAT };
 enum { PANEL_ON = 0, PANEL_OFF, PANEL_SLEEP };  /* STATIC: состояние панели */
                                                 /* DYN-4G: panel = 1 KEEP, 0 CYCLE */
 typedef struct { uint8_t grp, panel, lines, cpu; } step_t;
@@ -72,6 +76,17 @@ static const uint8_t CPUS[]         = { PWR_CPU_RUN, PWR_CPU_SLEEP, PWR_CPU_STOP
 static const char *const CPU_NAME[]   = { "RUN", "SLEEP", "STOP2" };
 static const char *const LINES_NAME[] = { "ACTIVE", "LOW", "HIGH", "ANALOG" };      /* индекс = pwr_lines_t */
 static const char *const PANEL_NAME[] = { "ANALOG ON", "ANALOG OFF", "DEEP SLEEP" };
+
+/* Варианты HAT-PWR: какая линия и в каком состоянии (остальные в 1). */
+static const struct { pwr_pin_t pin; pwr_pinmode_t mode; const char *name; } HAT_VAR[] = {
+    { PWR_PIN_DC,   PWR_PIN_HIGH,   "ALL HIGH"        },
+    { PWR_PIN_RST,  PWR_PIN_LOW,    "RST LOW"         },
+    { PWR_PIN_RST,  PWR_PIN_ANALOG, "RST ANALOG"      },
+    { PWR_PIN_CS,   PWR_PIN_ANALOG, "CS ANALOG"       },
+    { PWR_PIN_BUSY, PWR_PIN_ANALOG, "BUSY ANALOG"     },
+    { PWR_PIN_DC,   PWR_PIN_ANALOG, "DC ANALOG"       },
+    { PWR_PIN_SPI,  PWR_PIN_ANALOG, "SCK MOSI ANALOG" },
+};
 
 static void add_step(int grp, int panel, int lines, int cpu)
 {
@@ -105,16 +120,22 @@ static void build_steps(void)
         for (int c = 0; c < ARRAY_N(CPUS); c++)
             add_step(GRP_DYNBW, PWR_TEST_BW_KEEP, LINES_DYN[l], CPUS[c]);
 #endif
+#if PWR_GROUPS & 8
+    for (int v = 0; v < ARRAY_N(HAT_VAR); v++)
+        add_step(GRP_HAT, 0, v, PWR_CPU_STOP2);
+#endif
 }
 
 static const char *grp_name(int g)
 {
-    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : "DYN 1BIT");
+    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : (g == GRP_DYNBW ? "DYN 1BIT" : "HAT PWR"));
 }
 
 static void describe(const step_t *s, char *out, size_t n)
 {
-    if (s->grp == GRP_STATIC)
+    if (s->grp == GRP_HAT)
+        snprintf(out, n, "%s cpu=STOP2 panel=ANALOG OFF others=HIGH, %s", grp_name(s->grp), HAT_VAR[s->lines].name);
+    else if (s->grp == GRP_STATIC)
         snprintf(out, n, "%s cpu=%s panel=%s lines=%s", grp_name(s->grp), CPU_NAME[s->cpu],
                  PANEL_NAME[s->panel], LINES_NAME[s->lines]);
     else
@@ -173,6 +194,18 @@ static void draw_label(uint8_t *fb, int bw, int num, const step_t *s, int hold_s
 
     t_fb = fb; t_bw = bw;
     snprintf(l[0], sizeof l[0], "#%02d/%02d", num, s_n ? s_total_all : 0);
+    if (s->grp == GRP_HAT) {
+        char a[24];
+        snprintf(a, sizeof a, "#%02d/%02d HAT PWR", num, s_total_all);
+        t_box(10, 36, 253, 139);
+        t_text(18, 44, a, 2);
+        t_text(18, 62, "CPU:   STOP2", 2);
+        t_text(18, 80, "PANEL: ANALOG OFF", 2);
+        t_text(18, 98, HAT_VAR[s->lines].name, 2);
+        snprintf(l[4], sizeof l[4], "HOLD %d S", hold_s);
+        t_text(18, 116, l[4], 2);
+        return;
+    }
     if (s->grp == GRP_STATIC) {
         char a[24];
         snprintf(a, sizeof a, "#%02d/%02d STATIC", num, s_total_all);
@@ -272,6 +305,48 @@ static int step_static(const step_t *s, int num)
     pwr_quiet(0);
     pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);
     return EPD4G_OK;
+}
+
+/* ------------------------------ HAT-PWR ------------------------------------ */
+
+static int step_hat(const step_t *s, int num)
+{
+    const int hold_s = PWR_DWELL_STATIC_S;
+    int rc;
+
+    pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);
+    g_pwr_keep_gray = 1;
+    if ((rc = epd4g_init()) != EPD4G_OK)
+        return rc;
+    memcpy(cur, bg, sizeof cur);
+    draw_label(cur, 0, num, s, hold_s);
+    if ((rc = epd4g_full(cur, EPD4G_FULL_FAST)) != EPD4G_OK)
+        return rc;
+    if ((rc = epd4g_power_off()) != EPD4G_OK)       /* аналог выключен ДО любых манипуляций с линиями */
+        return rc;
+
+    pwr_lines_set(PWR_LINES_HIGH, 0);
+    pwr_pin_set(HAT_VAR[s->lines].pin, HAT_VAR[s->lines].mode);
+    DIAG("[HOLD] %d s, measure now\r\n", hold_s);
+    pwr_quiet(1);
+    hold(PWR_CPU_STOP2, (uint32_t)hold_s * 1000U);
+    pwr_quiet(0);
+
+    pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);
+    DIAG("[CHECK IMAGE] 8 s: did the picture survive? BUSY=%d\r\n",
+         (int)HAL_GPIO_ReadPin(EINK_BUSY_GPIO_Port, EINK_BUSY_Pin));
+    hold(PWR_CPU_SLEEP, 8000U);
+
+    uint32_t t0 = HAL_GetTick();
+    rc = epd4g_init();
+    const uint32_t t_init = HAL_GetTick() - t0;
+    DIAG("[RECOVER] init rc=%d, %lu ms\r\n", rc, (unsigned long)t_init);
+    if (rc != EPD4G_OK)
+        return rc;
+    t0 = HAL_GetTick();
+    rc = epd4g_full(cur, EPD4G_FULL_FAST);
+    DIAG("[RECOVER] full refresh rc=%d, %lu ms\r\n", rc, (unsigned long)(HAL_GetTick() - t0));
+    return rc;
 }
 
 /* ------------------------------ DYN-4G ------------------------------------- */
@@ -466,7 +541,8 @@ int eink_demo_task(void)
     describe(s, d, sizeof d);
     DIAG("\r\n[STEP %d/%d] %s\r\n", num, s_total_all, d);
     rc = s->grp == GRP_STATIC ? step_static(s, num)
-       : s->grp == GRP_DYN4G  ? step_dyn4g(s, num) : step_dynbw(s, num);
+       : s->grp == GRP_DYN4G  ? step_dyn4g(s, num)
+       : s->grp == GRP_HAT    ? step_hat(s, num) : step_dynbw(s, num);
     if (rc != EPD4G_OK) {
         DIAG("[ERROR] step %d failed rc=%d, panel is reset\r\n", num, rc);
         epd4g_abort();                          /* следующий шаг начнёт с init */

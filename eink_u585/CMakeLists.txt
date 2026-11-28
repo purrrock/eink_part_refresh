@@ -57,6 +57,9 @@ option(EINK_PROFILE "Печатать время по фазам каждого 
 option(EINK_POWER_TEST "Вместо демо собрать тест замера тока мультиметром (demo/eink_power_test.c, см. Docs/POWER_TEST.md)" OFF)
 set(PWR_DWELL_STATIC_S 15 CACHE STRING "Тест тока: секунд на статический режим")
 set(PWR_DWELL_DYN_S    30 CACHE STRING "Тест тока: секунд на динамический режим")
+set(PWR_GROUPS      7   CACHE STRING "Тест тока: маска групп (1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 HAT-PWR)")
+set(PWR_FIRST_STEP  1   CACHE STRING "Тест тока: первый шаг")
+set(PWR_LAST_STEP   999 CACHE STRING "Тест тока: последний шаг")
 option(PWR_TEST_BW_KEEP "Тест тока: 1-bit с включённым аналогом (в библиотеке не проверено на железе)" OFF)
 
 set(EPD4G_PROFILE ${EINK_PROFILE})          # передаём опцию библиотеке
@@ -79,6 +82,9 @@ if(EINK_POWER_TEST)
         EPD4G_USER_CONFIG="pwr_epd4g_cfg.h"
         PWR_DWELL_STATIC_S=${PWR_DWELL_STATIC_S}
         PWR_DWELL_DYN_S=${PWR_DWELL_DYN_S}
+        PWR_GROUPS=${PWR_GROUPS}
+        PWR_FIRST_STEP=${PWR_FIRST_STEP}
+        PWR_LAST_STEP=${PWR_LAST_STEP}
         PWR_TEST_BW_KEEP=$<BOOL:${PWR_TEST_BW_KEEP}>
     )
 else()

@@ -36,11 +36,21 @@ typedef enum {
 #define PWR_F_BUSY      1u  /**< в режиме ANALOG отключить и BUSY (в остальных режимах - вернуть вход)   */
 #define PWR_F_KEEP_CTL  2u  /**< не трогать CS и RST: библиотека держит RST низким в импульсе сброса     */
 
+/** Отдельные линии (для pwr_pin_set(); PWR_PIN_SPI = SCK и MOSI вместе). */
+typedef enum { PWR_PIN_RST = 0, PWR_PIN_CS, PWR_PIN_DC, PWR_PIN_BUSY, PWR_PIN_SPI } pwr_pin_t;
+typedef enum { PWR_PIN_LOW = 0, PWR_PIN_HIGH, PWR_PIN_ANALOG } pwr_pinmode_t;
+
 /** Один раз после MX_xxx_Init(): LSI, LPTIM1, TIM6 (eink_sleep_init). */
 void pwr_hw_init(void);
 
 /** Перевести линии в состояние @p mode (см. pwr_lines_t). Нельзя вызывать во время обмена по SPI. */
 void pwr_lines_set(pwr_lines_t mode, unsigned flags);
+
+/**
+ * Переопределить одну линию поверх pwr_lines_set(HIGH/LOW/ANALOG, ...) (SPI1 уже должен быть
+ * выключен). BUSY - вход: LOW/HIGH возвращают его цифровым входом, ANALOG отключает.
+ */
+void pwr_pin_set(pwr_pin_t pin, pwr_pinmode_t mode);
 
 /** 1 - дождаться конца вывода в UART и остановить USART1/USART2; 0 - включить обратно. */
 void pwr_quiet(int on);
