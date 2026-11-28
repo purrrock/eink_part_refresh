@@ -154,6 +154,19 @@ void pwr_pin_set(pwr_pin_t pin, pwr_pinmode_t mode)
     }
 }
 
+void pwr_hat_sleep(void)
+{
+    pwr_pin_set(PWR_PIN_RST, PWR_PIN_LOW);              /* RST первым: дальше ни одна линия не должна быть в 1 */
+    pwr_lines_set(PWR_LINES_LOW, PWR_F_KEEP_CTL);       /* SPI1 off, SCK/MOSI/DC = 0 */
+    pwr_pin_set(PWR_PIN_CS, PWR_PIN_LOW);
+    pwr_pin_set(PWR_PIN_BUSY, PWR_PIN_ANALOG);
+}
+
+void pwr_hat_wake(void)
+{
+    pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);        /* CS = RST = DC = 1, SPI1 on, BUSY - вход */
+}
+
 /* ---------------------------------- UART ----------------------------------- */
 
 static void uart_flush(UART_HandleTypeDef *h)

@@ -23,8 +23,14 @@
  *           группа 16: RST в 0 и разные комбинации остальных). После замера
  *           8 с на осмотр экрана (сохранилась ли картинка), затем время повторного init и полного обновления.
  *
+ *   WAKE    (PWR_GROUPS & 32) частичное обновление маркёра после сна HAT и порог окупаемости сна. Каждый шаг:
+ *           полное обновление, 3 частичных (маркёр едет), power off, простой PWR_WAKE_IDLE_S секунд, затем
+ *           следующий кадр: STAY - HAT не спал (эталон), SLP FULL - после сна init + полное обновление,
+ *           SLP PART - после сна init и сразу частичное обновление без полного (проверка, можно ли так).
+ *           Сравнивайте заряд от конца простоя до конца обновления (интеграл тока) - см. Docs/POWER_TEST.md.
+ *
  * Параметры (-D... в CMake): PWR_DWELL_STATIC_S, PWR_DWELL_DYN_S, PWR_ANALOG_ON_MAX_S, PWR_GROUPS (маска:
- * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
+ * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR, 32 WAKE), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
  */
 #define EINK_POWER_TEST 1
 #include "eink_demo.c"
@@ -52,6 +58,9 @@
 #ifndef PWR_LAST_STEP
 #define PWR_LAST_STEP        999
 #endif
+#ifndef PWR_WAKE_IDLE_S
+#define PWR_WAKE_IDLE_S      10         /* группа WAKE: длительность простоя между обновлениями */
+#endif
 #ifndef PWR_TEST_BW_KEEP
 #define PWR_TEST_BW_KEEP     0
 #endif
@@ -60,7 +69,7 @@ volatile unsigned char g_pwr_keep_gray = 1;     /* см. pwr_epd4g_cfg.h */
 
 /* ------------------------------ список шагов ------------------------------- */
 
-enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW, GRP_HAT };
+enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW, GRP_HAT, GRP_WAKE };
 enum { PANEL_ON = 0, PANEL_OFF, PANEL_SLEEP };  /* STATIC: состояние панели */
                                                 /* DYN-4G: panel = 1 KEEP, 0 CYCLE */
 typedef struct { uint8_t grp, panel, lines, cpu; } step_t;
@@ -107,6 +116,9 @@ static const struct { const char *name; uint8_t m[5]; } HAT_VAR[] = {
 #define HAT_N_G8   7
 #define HAT_N_ALL  ((int)ARRAY_N(HAT_VAR))
 
+static const char *const WAKE_NAME[] = { "STAY", "SLP FULL", "SLP PART" };
+#define WAKE_N  ((int)ARRAY_N(WAKE_NAME))
+
 static void add_step(int grp, int panel, int lines, int cpu)
 {
     s_total_all++;
@@ -139,6 +151,10 @@ static void build_steps(void)
         for (int c = 0; c < ARRAY_N(CPUS); c++)
             add_step(GRP_DYNBW, PWR_TEST_BW_KEEP, LINES_DYN[l], CPUS[c]);
 #endif
+#if PWR_GROUPS & 32
+    for (int v = 0; v < WAKE_N; v++)
+        add_step(GRP_WAKE, 0, v, PWR_CPU_STOP2);
+#endif
 #if PWR_GROUPS & 8
     for (int v = 0; v < HAT_N_G8; v++)
         add_step(GRP_HAT, 0, v, PWR_CPU_STOP2);
@@ -151,12 +167,14 @@ static void build_steps(void)
 
 static const char *grp_name(int g)
 {
-    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : (g == GRP_DYNBW ? "DYN 1BIT" : "HAT PWR"));
+    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : (g == GRP_DYNBW ? "DYN 1BIT" : (g == GRP_HAT ? "HAT PWR" : "WAKE")));
 }
 
 static void describe(const step_t *s, char *out, size_t n)
 {
-    if (s->grp == GRP_HAT)
+    if (s->grp == GRP_WAKE)
+        snprintf(out, n, "WAKE %s idle=%d s", WAKE_NAME[s->lines], PWR_WAKE_IDLE_S);
+    else if (s->grp == GRP_HAT)
         snprintf(out, n, "%s cpu=STOP2 panel=ANALOG OFF others=HIGH, %s", grp_name(s->grp), HAT_VAR[s->lines].name);
     else if (s->grp == GRP_STATIC)
         snprintf(out, n, "%s cpu=%s panel=%s lines=%s", grp_name(s->grp), CPU_NAME[s->cpu],
@@ -217,6 +235,16 @@ static void draw_label(uint8_t *fb, int bw, int num, const step_t *s, int hold_s
 
     t_fb = fb; t_bw = bw;
     snprintf(l[0], sizeof l[0], "#%02d/%02d", num, s_n ? s_total_all : 0);
+    if (s->grp == GRP_WAKE) {
+        snprintf(l[1], sizeof l[1], "WAKE TEST");
+        snprintf(l[2], sizeof l[2], "%s", WAKE_NAME[s->lines]);
+        snprintf(l[3], sizeof l[3], "IDLE %d S", PWR_WAKE_IDLE_S);
+        t_box(0, 100, 71, 175);
+        t_text(6, 106, l[0], 1);
+        for (int i = 1; i <= 3; i++)
+            t_text(6, 106 + i * 10, l[i], 1);
+        return;
+    }
     if (s->grp == GRP_HAT) {
         char a[24];
         snprintf(a, sizeof a, "#%02d/%02d HAT PWR", num, s_total_all);
@@ -418,6 +446,69 @@ static void dyn_report(uint32_t t0, int n)
          n ? (unsigned long)(dt / (uint32_t)n) : 0UL);
 }
 
+/* ------------------------------ WAKE --------------------------------------- */
+
+static int step_wake(const step_t *s, int num)
+{
+    const step_t rj = { GRP_DYN4G, 1, PWR_LINES_ACTIVE, PWR_CPU_STOP2 };   /* режимы для run_job */
+    const int variant = s->lines;                   /* 0 STAY, 1 SLP FULL, 2 SLP PART */
+    int rc;
+
+    pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);
+    g_pwr_keep_gray = 1;
+    if ((rc = epd4g_init()) != EPD4G_OK)
+        return rc;
+    memcpy(lbl, bg, sizeof lbl);
+    draw_label(lbl, 0, num, s, PWR_WAKE_IDLE_S);
+    route_restart();
+    if ((rc = epd4g_full(cur, EPD4G_FULL_FAST)) != EPD4G_OK)
+        return rc;
+    for (int i = 0; i < 3; i++) {                   /* маркёр едет: панель в обычном рабочем состоянии */
+        if ((rc = gray_frame_start()) != EPD4G_OK || (rc = run_job(&rj)) != EPD4G_OK)
+            return rc;
+    }
+    if ((rc = epd4g_power_off()) != EPD4G_OK)       /* аналог выключен до любых манипуляций с линиями */
+        return rc;
+
+    if (variant != 0)
+        pwr_hat_sleep();
+    DIAG("[IDLE] %d s, HAT %s\r\n", PWR_WAKE_IDLE_S, variant ? "ASLEEP" : "awake (power off only)");
+    pwr_quiet(1);
+    hold(PWR_CPU_STOP2, (uint32_t)PWR_WAKE_IDLE_S * 1000U);
+    pwr_quiet(0);
+
+    /* ---- конец простоя: от этой точки считайте заряд до конца обновления ---- */
+    const uint32_t t0 = HAL_GetTick();
+    uint32_t t_init = 0;
+    if (variant != 0) {
+        pwr_hat_wake();
+        if ((rc = epd4g_init()) != EPD4G_OK)
+            return rc;
+        t_init = HAL_GetTick() - t0;
+    }
+    if (variant == 1) {                             /* после сна: полное обновление следующего кадра */
+        const float s_new = s_pos + (float)EINK_STEP_PX;
+        track_draw(base, s_pos, s_new);
+        s_pos = s_new;
+        route_at(s_pos, &s_cx, &s_cy, &s_hx, &s_hy);
+        memcpy(cur, base, sizeof cur);
+        draw_marker(cur, s_cx, s_cy, s_hx, s_hy);
+        rc = epd4g_full(cur, EPD4G_FULL_FAST);
+    } else {                                        /* STAY и SLP PART: обычное частичное обновление */
+        if ((rc = gray_frame_start()) == EPD4G_OK)
+            rc = run_job(&rj);
+    }
+    DIAG("[WAKE] init %lu ms, update rc=%d, total %lu ms from end of idle\r\n", (unsigned long)t_init, rc,
+         (unsigned long)(HAL_GetTick() - t0));
+    if (rc != EPD4G_OK)
+        return rc;
+    if (variant != 1 && (rc = gray_frame_start()) == EPD4G_OK)      /* ещё кадр: работает ли штатно дальше */
+        rc = run_job(&rj);
+    DIAG("[CHECK IMAGE] 8 s: marker moved, background intact? rc=%d\r\n", rc);
+    hold(PWR_CPU_SLEEP, 8000U);
+    return rc;
+}
+
 static int step_dyn4g(const step_t *s, int num)
 {
     int rc, n = 0;
@@ -521,6 +612,7 @@ int eink_demo_init(void)
     render_map(bg);
     build_steps();
     (void)s_last_ms; (void)s_upd_cnt; (void)prev;
+    (void)CPUS; (void)LINES_DYN; (void)LINES_STATIC;       /* при выбранной части групп не все таблицы нужны */
 
     DIAG("\r\n=== POWER TEST: %d steps (static %d s, dynamic %d s) ===\r\n", s_n,
          PWR_DWELL_STATIC_S, PWR_DWELL_DYN_S);
@@ -569,7 +661,8 @@ int eink_demo_task(void)
     DIAG("\r\n[STEP %d/%d] %s\r\n", num, s_total_all, d);
     rc = s->grp == GRP_STATIC ? step_static(s, num)
        : s->grp == GRP_DYN4G  ? step_dyn4g(s, num)
-       : s->grp == GRP_HAT    ? step_hat(s, num) : step_dynbw(s, num);
+       : s->grp == GRP_HAT    ? step_hat(s, num)
+       : s->grp == GRP_WAKE   ? step_wake(s, num) : step_dynbw(s, num);
     if (rc != EPD4G_OK) {
         DIAG("[ERROR] step %d failed rc=%d, panel is reset\r\n", num, rc);
         epd4g_abort();                          /* следующий шаг начнёт с init */
