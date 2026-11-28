@@ -79,12 +79,23 @@ int epd4g_bw_clear(epd4g_bw_mode_t mode);
  *  otherwise EPD4G_ERR_NO_BASE. */
 int epd4g_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t *rect);
 
+/** Restore the 1-bit state after the panel controller lost its RAM (HAT powered down: RST = 0 with the
+ *  signal lines low, see pwr_hat_sleep() in the STM32U585 project): hardware reset, 1-bit init and
+ *  @p img - the picture that is on the glass - written to BOTH RAM planes, without a display update (no
+ *  flash, the analog part stays off). Partial updates can follow at once; no epd4g_bw_full() is needed.
+ *  @p img must be exactly what the panel shows, otherwise the next partial update redraws the difference. */
+int epd4g_bw_restore(const void *img, epd4g_src_t src);
+
+/** 1 if the driver is in the 1-bit mode (after epd4g_bw_init()/epd4g_bw_restore(), not after epd4g_init()). */
+int epd4g_bw_active(void);
+
 /* --------------------------- non-blocking API ---------------------------- */
 /* Same arguments and checks as above; see epd4g.h (epd4g_poll(), epd4g_result(), ...).
  * @p img must stay unchanged until the job is finished. */
 int epd4g_start_bw_init(epd4g_bw_mode_t mode);
 int epd4g_start_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode);
 int epd4g_start_bw_clear(epd4g_bw_mode_t mode);
+int epd4g_start_bw_restore(const void *img, epd4g_src_t src);
 int epd4g_start_bw_partial(const void *img, epd4g_src_t src, const epd4g_rect_t *rect);
 
 /* Deep sleep and power-off work in both modes: epd4g_sleep(), epd4g_power_off() (epd4g.h). */

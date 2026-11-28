@@ -61,7 +61,7 @@ option(EINK_PROFILE "Печатать время по фазам каждого 
 option(EINK_POWER_TEST "Вместо демо собрать тест замера тока мультиметром (demo/eink_power_test.c, см. Docs/POWER_TEST.md)" OFF)
 set(PWR_DWELL_STATIC_S 15 CACHE STRING "Тест тока: секунд на статический режим")
 set(PWR_DWELL_DYN_S    30 CACHE STRING "Тест тока: секунд на динамический режим")
-set(PWR_GROUPS      7   CACHE STRING "Тест тока: маска групп (1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR, 32 WAKE)")
+set(PWR_GROUPS      7   CACHE STRING "Тест тока: маска групп (1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR, 32 WAKE, 64 WAKE1B)")
 set(PWR_FIRST_STEP  1   CACHE STRING "Тест тока: первый шаг")
 set(PWR_LAST_STEP   999 CACHE STRING "Тест тока: последний шаг")
 set(PWR_WAKE_IDLE_S 10  CACHE STRING "Тест тока, группа WAKE: секунд простоя")

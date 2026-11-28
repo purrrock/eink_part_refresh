@@ -94,7 +94,7 @@ static const uint8_t lut_stock[159] = {
 /* ---------------------------- driver state ------------------------------- */
 enum { MODE_NONE = 0, MODE_GRAY, MODE_BW };
 enum { JOB_NONE = 0, JOB_INIT, JOB_FULL, JOB_PARTIAL, JOB_BW_INIT, JOB_BW_FULL, JOB_BW_PARTIAL,
-       JOB_POWER_OFF, JOB_SLEEP, JOB_NOP };
+       JOB_POWER_OFF, JOB_SLEEP, JOB_NOP, JOB_BW_RESTORE };
 
 static uint8_t s_mode;        /* MODE_xxx: set when an init job has finished, cleared by a timeout / sleep */
 static uint8_t s_io_err;      /* sticky: an SPI write failed during the current job */
@@ -657,6 +657,36 @@ static int job_bw_full(void)
     CR_END;
 }
 
+/* After the panel lost its RAM (the HAT was powered down): reset + 1-bit init (stock EPD_2IN7_V2_Init) and the
+ * picture that is on the glass into BOTH RAM planes (what Display_Base does), but NO display update, so the
+ * screen does not flash and the analog part stays off. Partial updates can continue right after it. */
+static int job_bw_restore(void)
+{
+    CR_BEGIN
+    if (s_powered) POWER_OFF_SEQ("pre-restore power off");
+    HW_RESET();
+    WAIT_BUSY("reset");
+    g_cmd(0x12);                                  /* SWRESET */
+    WAIT_BUSY("soft reset");
+    g_cmd(0x45); g_data(0x00); g_data(0x00); g_data(0x07); g_data(0x01);   /* RAM Y: 0..263 */
+    g_cmd(0x4F); g_data(0x00); g_data(0x00);      /* RAM Y counter 0 */
+    g_cmd(0x11); g_data(0x03);                    /* data entry mode */
+    s_mode = MODE_BW;
+    s_asleep = 0;
+    s_win_full = 1;                               /* power-on default of 0x44 is 0..21 bytes */
+    s_border_part = 0;
+    s_fast_lut = 0;
+    send_cursor(0, 0);
+    plane_begin(0, PASS_BW, 0, EPD4G_HEIGHT - 1, 0, EPD4G_BW_STRIDE - 1);
+    CR_SLICE(plane_step() == 0);
+    send_cursor(0, 0);
+    plane_begin(1, PASS_BW, 0, EPD4G_HEIGHT - 1, 0, EPD4G_BW_STRIDE - 1);
+    CR_SLICE(plane_step() == 0);
+    s_data = 0;
+    s_base = 1;                                   /* both planes hold the picture: partial updates are valid */
+    CR_END;
+}
+
 static int job_bw_partial(void)
 {
     CR_BEGIN
@@ -701,6 +731,7 @@ static int job_run(void)
     case JOB_BW_INIT:    return job_bw_init();
     case JOB_BW_FULL:    return job_bw_full();
     case JOB_BW_PARTIAL: return job_bw_partial();
+    case JOB_BW_RESTORE: return job_bw_restore();
     case JOB_POWER_OFF:  return job_power_off();
     case JOB_SLEEP:      return job_sleep();
     case JOB_NOP:        return 0;                 /* nothing to do: finishes (result, callback) in this poll */
@@ -960,6 +991,25 @@ int epd4g_start_bw_full(const void *img, epd4g_src_t src, epd4g_bw_mode_t mode)
     return EPD4G_OK;
 }
 
+int epd4g_start_bw_restore(const void *img, epd4g_src_t src)
+{
+    int rc;
+    if (img == NULL && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
+    if (src != EPD4G_SRC_1BPP && src != EPD4G_SRC_2BPP && src != EPD4G_SRC_WHITE) return EPD4G_ERR_PARAM;
+    rc = job_start(JOB_BW_RESTORE);
+    if (rc != EPD4G_OK) return rc;
+    s_mode = MODE_NONE;                                        /* like epd4g_start_bw_init() */
+    tables_init();
+    s_data = (src != EPD4G_SRC_WHITE);
+    J.img = img; J.src = (uint8_t)src; J.bwmode = (uint8_t)EPD4G_BW_NORMAL;
+    return EPD4G_OK;
+}
+
+int epd4g_bw_active(void)
+{
+    return s_mode == MODE_BW;
+}
+
 int epd4g_start_bw_clear(epd4g_bw_mode_t mode)
 {
     return epd4g_start_bw_full(NULL, EPD4G_SRC_WHITE, mode);
@@ -1013,5 +1063,6 @@ int epd4g_power_off(void)                            { return blocking(epd4g_sta
 int epd4g_sleep(void)                                { return blocking(epd4g_start_sleep()); }
 int epd4g_bw_init(epd4g_bw_mode_t m)                 { return blocking(epd4g_start_bw_init(m)); }
 int epd4g_bw_full(const void *img, epd4g_src_t s, epd4g_bw_mode_t m) { return blocking(epd4g_start_bw_full(img, s, m)); }
+int epd4g_bw_restore(const void *img, epd4g_src_t s)  { return blocking(epd4g_start_bw_restore(img, s)); }
 int epd4g_bw_clear(epd4g_bw_mode_t m)                { return blocking(epd4g_start_bw_clear(m)); }
 int epd4g_bw_partial(const void *img, epd4g_src_t s, const epd4g_rect_t *r) { return blocking(epd4g_start_bw_partial(img, s, r)); }

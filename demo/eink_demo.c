@@ -111,8 +111,9 @@
 
 /* 1 - только STM32U585 (Core/Src/eink_pwr.c): паузы проводить в Stop 2, а в паузах 4 gray ещё и усыплять
  * HAT (power off аналога, RST = 0, линии в 0): ~0.3 мА вместо ~1.9 мА. После пробуждения - init и обычное
- * частичное обновление (проверено на железе). В 1-bit паузах HAT не усыпляется: частичное обновление
- * 1-bit опирается на RAM контроллера, которая при обесточивании HAT теряется. */
+ * частичное обновление (4 gray проверено на железе). В 1-bit паузах то же самое, но после пробуждения
+ * epd4g_bw_restore() пишет текущую картинку в обе плоскости RAM контроллера (при обесточивании HAT она
+ * теряется), экран при этом не мигает. */
 #ifndef EINK_HAT_SLEEP
 #define EINK_HAT_SLEEP          0
 #endif
@@ -593,8 +594,9 @@ static void gap_wait(uint32_t ms)
 #endif
 }
 
-/* Дожидается конца периода. gray != 0: панель в режиме 4 gray, HAT можно усыпить. 0 - ок, -1 - ошибка. */
-static int gap_idle(uint32_t period_ms, int gray)
+/* Дожидается конца периода. bw_img - кадр 1-bit, который сейчас на панели (нужен, чтобы восстановить RAM
+ * контроллера после сна HAT); NULL - панель в режиме 4 gray. 0 - ок, -1 - ошибка. */
+static int gap_idle(uint32_t period_ms, const void *bw_img)
 {
     if (period_ms == 0U || !s_t_valid)
         return 0;
@@ -604,7 +606,7 @@ static int gap_idle(uint32_t period_ms, int gray)
     uint32_t rem = period_ms - el;
 
 #if EINK_HAT_SLEEP
-    if (gray && rem >= EINK_HAT_SLEEP_MIN_MS) {
+    if (rem >= EINK_HAT_SLEEP_MIN_MS) {
         int rc = pwr_hat_sleep();           /* power off аналога + RST = 0 + линии в 0 */
         if (rc != EPD4G_OK) {
             DIAG("[ERROR][GAP] hat sleep rc=%d\r\n", rc);
@@ -614,7 +616,7 @@ static int gap_idle(uint32_t period_ms, int gray)
         rem = el < period_ms ? period_ms - el : 0U;
         DIAG("[GAP] HAT sleep, Stop 2 for %lu ms\r\n", (unsigned long)rem);
         gap_wait(rem);
-        rc = pwr_hat_wake();                /* линии назад + epd4g_init(), картинка на панели сохранилась */
+        rc = pwr_hat_wake(bw_img, EPD4G_SRC_1BPP);   /* линии назад + init (4 gray) или restore RAM (1-bit) */
         if (rc != EPD4G_OK) {
             DIAG("[ERROR][GAP] hat wake rc=%d\r\n", rc);
             return -1;
@@ -623,7 +625,7 @@ static int gap_idle(uint32_t period_ms, int gray)
         return 0;
     }
 #else
-    (void)gray;
+    (void)bw_img;
 #endif
     DIAG("[GAP] %s %lu ms\r\n", EINK_HAT_SLEEP ? "Stop 2" : "wait", (unsigned long)rem);
     gap_wait(rem);
@@ -631,7 +633,7 @@ static int gap_idle(uint32_t period_ms, int gray)
 }
 #else
 static void gap_mark(void) {}
-static int gap_idle(uint32_t period_ms, int gray) { (void)period_ms; (void)gray; return 0; }
+static int gap_idle(uint32_t period_ms, const void *bw_img) { (void)period_ms; (void)bw_img; return 0; }
 #endif
 
 /* --------------------------------- API ------------------------------------ */
@@ -802,7 +804,7 @@ static int start_next(void)
 {
     switch (s_act) {
     case A_GRAY_FRAME:
-        if (gap_idle(EINK_UPDATE_PERIOD_MS, 1) != 0)
+        if (gap_idle(EINK_UPDATE_PERIOD_MS, NULL) != 0)
             return -1;
 #if EINK_BW_DEMO
         if (s_frames >= EINK_BW_EVERY) {
@@ -822,7 +824,7 @@ static int start_next(void)
         gap_mark();
         return job_started(epd4g_start_bw_full(bw, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL));
     case A_BW_STEP: {
-        if (gap_idle(EINK_BW_PERIOD_MS, 0) != 0)    /* 1-bit: HAT не усыпляем, только Stop 2 */
+        if (gap_idle(EINK_BW_PERIOD_MS, bw) != 0)    /* 1-bit: HAT тоже спит, картинка bw - для restore */
             return -1;
         if (s_bw_steps >= EINK_BW_STEPS) {
             DIAG("[MODE] 1 bit -> 4 gray\r\n");

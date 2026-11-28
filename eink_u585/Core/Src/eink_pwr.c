@@ -8,6 +8,7 @@
 
 #include "eink_sleep.h"
 #include "epd4g.h"
+#include "epd4g_bw.h"
 #include "main.h"
 #include "spi.h"
 #include "usart.h"
@@ -156,6 +157,7 @@ void pwr_pin_set(pwr_pin_t pin, pwr_pinmode_t mode)
 }
 
 static uint8_t s_hat_asleep;
+static uint8_t s_hat_bw;                        /* панель спала в режиме 1-bit */
 
 int pwr_hat_sleep(void)
 {
@@ -166,6 +168,7 @@ int pwr_hat_sleep(void)
     rc = epd4g_power_off();                             /* аналог панели - ДО сна, иначе тёмные участки светлеют */
     if (rc != EPD4G_OK)
         return rc;
+    s_hat_bw = (uint8_t)epd4g_bw_active();
     pwr_pin_set(PWR_PIN_RST, PWR_PIN_LOW);              /* RST первым: дальше ни одна линия не должна быть в 1 */
     pwr_lines_set(PWR_LINES_LOW, PWR_F_KEEP_CTL);       /* SPI1 off, SCK/MOSI/DC = 0 */
     pwr_pin_set(PWR_PIN_CS, PWR_PIN_LOW);
@@ -174,13 +177,16 @@ int pwr_hat_sleep(void)
     return 0;
 }
 
-int pwr_hat_wake(void)
+int pwr_hat_wake(const void *img, epd4g_src_t src)
 {
     if (!s_hat_asleep)
         return 0;
+    if (s_hat_bw && img == NULL && src != EPD4G_SRC_WHITE)
+        return EPD4G_ERR_PARAM;                         /* без картинки 1-bit не восстановить; HAT остаётся спать */
     pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);        /* CS = RST = DC = 1, SPI1 on, BUSY - вход */
     s_hat_asleep = 0;
-    return epd4g_init();                                /* сброс панели, режим 4 gray */
+    return s_hat_bw ? epd4g_bw_restore(img, src)        /* сброс, init, картинка в обе плоскости, без вспышки */
+                    : epd4g_init();                     /* сброс панели, режим 4 gray */
 }
 
 int pwr_hat_asleep(void)

@@ -28,9 +28,11 @@
  *           следующий кадр: STAY - HAT не спал (эталон), SLP FULL - после сна init + полное обновление,
  *           SLP PART - после сна init и сразу частичное обновление без полного (проверка, можно ли так).
  *           Сравнивайте заряд от конца простоя до конца обновления (интеграл тока) - см. Docs/POWER_TEST.md.
+ *   WAKE1B  (PWR_GROUPS & 64) то же для 1-bit меню: после сна HAT epd4g_bw_restore() (RAM контроллера, без
+ *           вспышки) и обычные частичные обновления. Шаги STAY 1B (эталон) и SLP 1B.
  *
  * Параметры (-D... в CMake): PWR_DWELL_STATIC_S, PWR_DWELL_DYN_S, PWR_ANALOG_ON_MAX_S, PWR_GROUPS (маска:
- * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR, 32 WAKE), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
+ * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR, 32 WAKE, 64 WAKE1B), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
  */
 #define EINK_POWER_TEST 1
 #include "eink_demo.c"
@@ -69,7 +71,7 @@ volatile unsigned char g_pwr_keep_gray = 1;     /* см. pwr_epd4g_cfg.h */
 
 /* ------------------------------ список шагов ------------------------------- */
 
-enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW, GRP_HAT, GRP_WAKE };
+enum { GRP_STATIC = 0, GRP_DYN4G, GRP_DYNBW, GRP_HAT, GRP_WAKE, GRP_WAKE1B };
 enum { PANEL_ON = 0, PANEL_OFF, PANEL_SLEEP };  /* STATIC: состояние панели */
                                                 /* DYN-4G: panel = 1 KEEP, 0 CYCLE */
 typedef struct { uint8_t grp, panel, lines, cpu; } step_t;
@@ -116,6 +118,7 @@ static const struct { const char *name; uint8_t m[5]; } HAT_VAR[] = {
 #define HAT_N_G8   7
 #define HAT_N_ALL  ((int)ARRAY_N(HAT_VAR))
 
+static const char *const WAKE1B_NAME[] = { "STAY 1B", "SLP 1B" };
 static const char *const WAKE_NAME[] = { "STAY", "SLP FULL", "SLP PART" };
 #define WAKE_N  ((int)ARRAY_N(WAKE_NAME))
 
@@ -155,6 +158,10 @@ static void build_steps(void)
     for (int v = 0; v < WAKE_N; v++)
         add_step(GRP_WAKE, 0, v, PWR_CPU_STOP2);
 #endif
+#if PWR_GROUPS & 64
+    for (int v = 0; v < 2; v++)
+        add_step(GRP_WAKE1B, 0, v, PWR_CPU_STOP2);
+#endif
 #if PWR_GROUPS & 8
     for (int v = 0; v < HAT_N_G8; v++)
         add_step(GRP_HAT, 0, v, PWR_CPU_STOP2);
@@ -167,12 +174,14 @@ static void build_steps(void)
 
 static const char *grp_name(int g)
 {
-    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : (g == GRP_DYNBW ? "DYN 1BIT" : (g == GRP_HAT ? "HAT PWR" : "WAKE")));
+    return g == GRP_STATIC ? "STATIC" : (g == GRP_DYN4G ? "DYN 4GRAY" : (g == GRP_DYNBW ? "DYN 1BIT" : (g == GRP_HAT ? "HAT PWR" : (g == GRP_WAKE ? "WAKE" : "WAKE 1BIT"))));
 }
 
 static void describe(const step_t *s, char *out, size_t n)
 {
-    if (s->grp == GRP_WAKE)
+    if (s->grp == GRP_WAKE1B)
+        snprintf(out, n, "WAKE1B %s idle=%d s", WAKE1B_NAME[s->lines], PWR_WAKE_IDLE_S);
+    else if (s->grp == GRP_WAKE)
         snprintf(out, n, "WAKE %s idle=%d s", WAKE_NAME[s->lines], PWR_WAKE_IDLE_S);
     else if (s->grp == GRP_HAT)
         snprintf(out, n, "%s cpu=STOP2 panel=ANALOG OFF others=HIGH, %s", grp_name(s->grp), HAT_VAR[s->lines].name);
@@ -235,6 +244,16 @@ static void draw_label(uint8_t *fb, int bw, int num, const step_t *s, int hold_s
 
     t_fb = fb; t_bw = bw;
     snprintf(l[0], sizeof l[0], "#%02d/%02d", num, s_n ? s_total_all : 0);
+    if (s->grp == GRP_WAKE1B) {
+        snprintf(l[1], sizeof l[1], "WAKE 1BIT");
+        snprintf(l[2], sizeof l[2], "%s", WAKE1B_NAME[s->lines]);
+        snprintf(l[3], sizeof l[3], "IDLE %d S", PWR_WAKE_IDLE_S);
+        t_box(0, 8, 71, 83);
+        t_text(6, 14, l[0], 1);
+        for (int i = 1; i <= 3; i++)
+            t_text(6, 14 + i * 10, l[i], 1);
+        return;
+    }
     if (s->grp == GRP_WAKE) {
         snprintf(l[1], sizeof l[1], "WAKE TEST");
         snprintf(l[2], sizeof l[2], "%s", WAKE_NAME[s->lines]);
@@ -481,7 +500,7 @@ static int step_wake(const step_t *s, int num)
     const uint32_t t0 = HAL_GetTick();
     uint32_t t_init = 0;
     if (variant != 0) {
-        if ((rc = pwr_hat_wake()) != EPD4G_OK)      /* линии назад + epd4g_init() */
+        if ((rc = pwr_hat_wake(NULL, EPD4G_SRC_WHITE)) != EPD4G_OK)   /* линии назад + epd4g_init() */
             return rc;
         t_init = HAL_GetTick() - t0;
     }
@@ -599,6 +618,60 @@ static int step_dynbw(const step_t *s, int num)
     return rc;
 }
 
+/* ------------------------------ WAKE-1B ------------------------------------ */
+
+/* 1-bit: сон HAT и восстановление RAM контроллера (epd4g_bw_restore) вместо полного обновления. */
+static int step_wake1b(const step_t *s, int num)
+{
+    const step_t rj = { GRP_DYNBW, 0, PWR_LINES_ACTIVE, PWR_CPU_STOP2 };
+    const int sleep_hat = s->lines;                 /* 0 STAY 1B, 1 SLP 1B */
+    int rc, sel = 0;
+
+    pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);
+    if ((rc = epd4g_bw_init(EPD4G_BW_NORMAL)) != EPD4G_OK)
+        return rc;
+    epd4g_bw_fb_fill(bwbuf, 1);
+    draw_label(bwbuf, 1, num, s, PWR_WAKE_IDLE_S);
+    for (int i = 0; i < PT_MENU_ROWS; i++)
+        (void)menu_row(i, i == sel);
+    if ((rc = epd4g_bw_full(bwbuf, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL)) != EPD4G_OK)
+        return rc;
+    for (int k = 0; k < 4; k++) {                   /* курсор меню едет: обычное рабочее состояние */
+        epd4g_rect_t a = menu_row(sel, 0);
+        sel = (sel + 1) % PT_MENU_ROWS;
+        epd4g_rect_t b = menu_row(sel, 1);
+        epd4g_rect_t r = rect_union(a, b);
+        if ((rc = epd4g_start_bw_partial(bwbuf, EPD4G_SRC_1BPP, &r)) != EPD4G_OK || (rc = run_job(&rj)) != EPD4G_OK)
+            return rc;
+    }
+    if (sleep_hat && (rc = pwr_hat_sleep()) != EPD4G_OK)
+        return rc;
+    DIAG("[IDLE] %d s, HAT %s\r\n", PWR_WAKE_IDLE_S, sleep_hat ? "ASLEEP (1-bit)" : "awake");
+    pwr_quiet(1);
+    hold(PWR_CPU_STOP2, (uint32_t)PWR_WAKE_IDLE_S * 1000U);
+    pwr_quiet(0);
+
+    /* ---- конец простоя: от этой точки считайте заряд до конца обновления ---- */
+    uint32_t t0 = HAL_GetTick();
+    if (sleep_hat && (rc = pwr_hat_wake(bwbuf, EPD4G_SRC_1BPP)) != EPD4G_OK)    /* restore RAM, без вспышки */
+        return rc;
+    const uint32_t t_wake = HAL_GetTick() - t0;
+    for (int k = 0; k < 2; k++) {
+        epd4g_rect_t a = menu_row(sel, 0);
+        sel = (sel + 1) % PT_MENU_ROWS;
+        epd4g_rect_t b = menu_row(sel, 1);
+        epd4g_rect_t r = rect_union(a, b);
+        if ((rc = epd4g_start_bw_partial(bwbuf, EPD4G_SRC_1BPP, &r)) != EPD4G_OK || (rc = run_job(&rj)) != EPD4G_OK)
+            return rc;
+        if (k == 0)
+            DIAG("[WAKE] restore %lu ms, first update done %lu ms from end of idle\r\n",
+                 (unsigned long)t_wake, (unsigned long)(HAL_GetTick() - t0));
+    }
+    DIAG("[CHECK IMAGE] 8 s: menu intact, cursor moved, no garbage? rc=%d\r\n", rc);
+    hold(PWR_CPU_SLEEP, 8000U);
+    return rc;
+}
+
 /* --------------------------------- API ------------------------------------- */
 
 int eink_demo_init(void)
@@ -661,7 +734,8 @@ int eink_demo_task(void)
     rc = s->grp == GRP_STATIC ? step_static(s, num)
        : s->grp == GRP_DYN4G  ? step_dyn4g(s, num)
        : s->grp == GRP_HAT    ? step_hat(s, num)
-       : s->grp == GRP_WAKE   ? step_wake(s, num) : step_dynbw(s, num);
+       : s->grp == GRP_WAKE   ? step_wake(s, num)
+       : s->grp == GRP_WAKE1B ? step_wake1b(s, num) : step_dynbw(s, num);
     if (rc != EPD4G_OK) {
         DIAG("[ERROR] step %d failed rc=%d, panel is reset\r\n", num, rc);
         epd4g_abort();                          /* следующий шаг начнёт с init */
