@@ -605,20 +605,18 @@ static int gap_idle(uint32_t period_ms, int gray)
 
 #if EINK_HAT_SLEEP
     if (gray && rem >= EINK_HAT_SLEEP_MIN_MS) {
-        int rc = epd4g_power_off();         /* аналог панели выключить ДО сна, иначе тёмные участки светлеют */
+        int rc = pwr_hat_sleep();           /* power off аналога + RST = 0 + линии в 0 */
         if (rc != EPD4G_OK) {
-            DIAG("[ERROR][GAP] power off rc=%d\r\n", rc);
+            DIAG("[ERROR][GAP] hat sleep rc=%d\r\n", rc);
             return -1;
         }
         el = HAL_GetTick() - s_t_last;
         rem = el < period_ms ? period_ms - el : 0U;
         DIAG("[GAP] HAT sleep, Stop 2 for %lu ms\r\n", (unsigned long)rem);
-        pwr_hat_sleep();
         gap_wait(rem);
-        pwr_hat_wake();
-        rc = epd4g_init();                  /* аппаратный сброс, ~50 мс; картинка на панели сохранилась */
+        rc = pwr_hat_wake();                /* линии назад + epd4g_init(), картинка на панели сохранилась */
         if (rc != EPD4G_OK) {
-            DIAG("[ERROR][GAP] init after wake rc=%d\r\n", rc);
+            DIAG("[ERROR][GAP] hat wake rc=%d\r\n", rc);
             return -1;
         }
         DIAG("[GAP] HAT awake\r\n");

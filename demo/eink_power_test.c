@@ -470,8 +470,8 @@ static int step_wake(const step_t *s, int num)
     if ((rc = epd4g_power_off()) != EPD4G_OK)       /* аналог выключен до любых манипуляций с линиями */
         return rc;
 
-    if (variant != 0)
-        pwr_hat_sleep();
+    if (variant != 0 && (rc = pwr_hat_sleep()) != EPD4G_OK)   /* power off + сон HAT */
+        return rc;
     DIAG("[IDLE] %d s, HAT %s\r\n", PWR_WAKE_IDLE_S, variant ? "ASLEEP" : "awake (power off only)");
     pwr_quiet(1);
     hold(PWR_CPU_STOP2, (uint32_t)PWR_WAKE_IDLE_S * 1000U);
@@ -481,8 +481,7 @@ static int step_wake(const step_t *s, int num)
     const uint32_t t0 = HAL_GetTick();
     uint32_t t_init = 0;
     if (variant != 0) {
-        pwr_hat_wake();
-        if ((rc = epd4g_init()) != EPD4G_OK)
+        if ((rc = pwr_hat_wake()) != EPD4G_OK)      /* линии назад + epd4g_init() */
             return rc;
         t_init = HAL_GetTick() - t0;
     }

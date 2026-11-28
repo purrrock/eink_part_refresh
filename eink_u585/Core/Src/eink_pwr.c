@@ -7,6 +7,7 @@
 #include "eink_pwr.h"
 
 #include "eink_sleep.h"
+#include "epd4g.h"
 #include "main.h"
 #include "spi.h"
 #include "usart.h"
@@ -154,17 +155,37 @@ void pwr_pin_set(pwr_pin_t pin, pwr_pinmode_t mode)
     }
 }
 
-void pwr_hat_sleep(void)
+static uint8_t s_hat_asleep;
+
+int pwr_hat_sleep(void)
 {
+    int rc;
+
+    if (s_hat_asleep)
+        return 0;
+    rc = epd4g_power_off();                             /* аналог панели - ДО сна, иначе тёмные участки светлеют */
+    if (rc != EPD4G_OK)
+        return rc;
     pwr_pin_set(PWR_PIN_RST, PWR_PIN_LOW);              /* RST первым: дальше ни одна линия не должна быть в 1 */
     pwr_lines_set(PWR_LINES_LOW, PWR_F_KEEP_CTL);       /* SPI1 off, SCK/MOSI/DC = 0 */
     pwr_pin_set(PWR_PIN_CS, PWR_PIN_LOW);
     pwr_pin_set(PWR_PIN_BUSY, PWR_PIN_ANALOG);
+    s_hat_asleep = 1;
+    return 0;
 }
 
-void pwr_hat_wake(void)
+int pwr_hat_wake(void)
 {
+    if (!s_hat_asleep)
+        return 0;
     pwr_lines_set(PWR_LINES_ACTIVE, PWR_F_BUSY);        /* CS = RST = DC = 1, SPI1 on, BUSY - вход */
+    s_hat_asleep = 0;
+    return epd4g_init();                                /* сброс панели, режим 4 gray */
+}
+
+int pwr_hat_asleep(void)
+{
+    return s_hat_asleep;
 }
 
 /* ---------------------------------- UART ----------------------------------- */
