@@ -100,6 +100,29 @@
 #define EINK_BW_STEPS       10
 #endif
 
+/* Паузы между обновлениями (имитация PurrGO: экран обновляется не чаще, чем раз в несколько секунд).
+ * Период считается от начала предыдущего обновления до начала следующего; 0 - без пауз (подряд). */
+#ifndef EINK_UPDATE_PERIOD_MS
+#define EINK_UPDATE_PERIOD_MS   0           /* кадры карты 4 gray */
+#endif
+#ifndef EINK_BW_PERIOD_MS
+#define EINK_BW_PERIOD_MS       EINK_UPDATE_PERIOD_MS   /* шаги 1-bit меню */
+#endif
+
+/* 1 - только STM32U585 (Core/Src/eink_pwr.c): паузы проводить в Stop 2, а в паузах 4 gray ещё и усыплять
+ * HAT (power off аналога, RST = 0, линии в 0): ~0.3 мА вместо ~1.9 мА. После пробуждения - init и обычное
+ * частичное обновление (проверено на железе). В 1-bit паузах HAT не усыпляется: частичное обновление
+ * 1-bit опирается на RAM контроллера, которая при обесточивании HAT теряется. */
+#ifndef EINK_HAT_SLEEP
+#define EINK_HAT_SLEEP          0
+#endif
+#ifndef EINK_HAT_SLEEP_MIN_MS
+#define EINK_HAT_SLEEP_MIN_MS   1500        /* паузы короче - HAT не усыплять (окупаемость < 1 с, запас на init) */
+#endif
+#if EINK_HAT_SLEEP
+#include "eink_pwr.h"
+#endif
+
 #define MK_R        10                      /* запас вокруг центра маркёра (его размер +-9 px) */
 
 static uint8_t bg[EPD4G_FB_BYTES];          /* карта без трека */
@@ -540,6 +563,79 @@ static int push_update(const epd4g_rect_t *roi)
     return 0;
 }
 
+/* ------------------------------ паузы -------------------------------------- */
+
+#if EINK_UPDATE_PERIOD_MS || EINK_BW_PERIOD_MS
+static uint32_t s_t_last;                   /* когда запущено последнее обновление кадра/шага */
+static int      s_t_valid;
+
+static void gap_mark(void)
+{
+    s_t_last = HAL_GetTick();
+    s_t_valid = 1;
+}
+
+static void gap_wait(uint32_t ms)
+{
+#if EINK_HAT_SLEEP
+    const uint32_t t_end = HAL_GetTick() + ms;
+
+    pwr_quiet(1);                           /* UART на время сна выключен */
+    for (;;) {
+        const int32_t left = (int32_t)(t_end - HAL_GetTick());
+        if (left <= 0)
+            break;
+        (void)pwr_wait(PWR_CPU_STOP2, (uint32_t)left, 0);
+    }
+    pwr_quiet(0);
+#else
+    HAL_Delay(ms);
+#endif
+}
+
+/* Дожидается конца периода. gray != 0: панель в режиме 4 gray, HAT можно усыпить. 0 - ок, -1 - ошибка. */
+static int gap_idle(uint32_t period_ms, int gray)
+{
+    if (period_ms == 0U || !s_t_valid)
+        return 0;
+    uint32_t el = HAL_GetTick() - s_t_last;
+    if (el >= period_ms)
+        return 0;
+    uint32_t rem = period_ms - el;
+
+#if EINK_HAT_SLEEP
+    if (gray && rem >= EINK_HAT_SLEEP_MIN_MS) {
+        int rc = epd4g_power_off();         /* аналог панели выключить ДО сна, иначе тёмные участки светлеют */
+        if (rc != EPD4G_OK) {
+            DIAG("[ERROR][GAP] power off rc=%d\r\n", rc);
+            return -1;
+        }
+        el = HAL_GetTick() - s_t_last;
+        rem = el < period_ms ? period_ms - el : 0U;
+        DIAG("[GAP] HAT sleep, Stop 2 for %lu ms\r\n", (unsigned long)rem);
+        pwr_hat_sleep();
+        gap_wait(rem);
+        pwr_hat_wake();
+        rc = epd4g_init();                  /* аппаратный сброс, ~50 мс; картинка на панели сохранилась */
+        if (rc != EPD4G_OK) {
+            DIAG("[ERROR][GAP] init after wake rc=%d\r\n", rc);
+            return -1;
+        }
+        DIAG("[GAP] HAT awake\r\n");
+        return 0;
+    }
+#else
+    (void)gray;
+#endif
+    DIAG("[GAP] %s %lu ms\r\n", EINK_HAT_SLEEP ? "Stop 2" : "wait", (unsigned long)rem);
+    gap_wait(rem);
+    return 0;
+}
+#else
+static void gap_mark(void) {}
+static int gap_idle(uint32_t period_ms, int gray) { (void)period_ms; (void)gray; return 0; }
+#endif
+
 /* --------------------------------- API ------------------------------------ */
 
 /* Маркёр в начало маршрута, чистая карта без трека: cur = bg (маркёр дорисовывает вызывающий). */
@@ -555,6 +651,9 @@ int eink_demo_init(void)
 {
     int rc;
 
+#if EINK_HAT_SLEEP
+    pwr_hw_init();                          /* LSI, LPTIM1 (будильник Stop 2), TIM6 */
+#endif
     DIAG("[INIT] epd4g_init()\r\n");
     if ((rc = epd4g_init()) != EPD4G_OK) {
         DIAG("[ERROR][INIT] epd4g_init rc=%d\r\n", rc);
@@ -582,6 +681,7 @@ int eink_demo_init(void)
         DIAG("[ERROR][INIT] initial marker update failed\r\n");
         return -1;
     }
+    gap_mark();
     DIAG("[INIT] complete; route length %d px, marker=(%d,%d)\r\n", (int)rt_cum[ROUTE_N], s_cx, s_cy);
     return 0;
 }
@@ -704,6 +804,8 @@ static int start_next(void)
 {
     switch (s_act) {
     case A_GRAY_FRAME:
+        if (gap_idle(EINK_UPDATE_PERIOD_MS, 1) != 0)
+            return -1;
 #if EINK_BW_DEMO
         if (s_frames >= EINK_BW_EVERY) {
             DIAG("[MODE] 4 gray -> 1 bit\r\n");
@@ -713,13 +815,17 @@ static int start_next(void)
         }
 #endif
         s_frames++;
+        gap_mark();
         return start_gray_frame();
     case A_BW_FULL:
         bw_render_menu();
         s_act = A_BW_STEP;
         DIAG("[MODE] 1-bit full refresh\r\n");
+        gap_mark();
         return job_started(epd4g_start_bw_full(bw, EPD4G_SRC_1BPP, EPD4G_BW_NORMAL));
     case A_BW_STEP: {
+        if (gap_idle(EINK_BW_PERIOD_MS, 0) != 0)    /* 1-bit: HAT не усыпляем, только Stop 2 */
+            return -1;
         if (s_bw_steps >= EINK_BW_STEPS) {
             DIAG("[MODE] 1 bit -> 4 gray\r\n");
             s_act = A_GRAY_FULL;
@@ -730,10 +836,12 @@ static int start_next(void)
         epd4g_rect_t b = bw_draw_row(s_sel, 1);
         epd4g_rect_t r = rect_union(a, b);
         s_bw_steps++;
+        gap_mark();
         DIAG("[UPDATE] 1-bit cursor -> row %d\r\n", s_sel);
         return job_started(epd4g_start_bw_partial(bw, EPD4G_SRC_1BPP, &r));
     }
     case A_GRAY_FULL:
+        gap_mark();
         s_act = A_GRAY_FRAME;
         memcpy(prev, cur, sizeof prev);
         s_upd_cnt = 0;

@@ -52,6 +52,10 @@ option(EINK_DIAG    "Печатать журнал демо в отладочн�
 set(EINK_DEBUG_USART "1" CACHE STRING "Номер USART для отладочной консоли (1 или 2)")
 set_property(CACHE EINK_DEBUG_USART PROPERTY STRINGS 1 2)
 option(EINK_SLEEP   "Между опросами epd4g спать в Sleep по подсказке epd4g_wait_hint() (TIM6 + EXTI2 по BUSY)" ON)
+option(EINK_HAT_SLEEP "Паузы между обновлениями в Stop 2, в паузах 4 gray усыплять HAT (около 0.3 мА, см. Docs/POWER_TEST.md)" ON)
+set(EINK_UPDATE_PERIOD_MS 5000 CACHE STRING "Период обновлений карты 4 gray, мс (от начала до начала), 0 - подряд")
+set(EINK_BW_PERIOD_MS     5000 CACHE STRING "Период шагов 1-bit меню, мс, 0 - подряд")
+set(EINK_BW_EVERY         30   CACHE STRING "Сколько кадров карты 4 gray показывать до перехода в 1-bit меню")
 option(EINK_PROFILE "Печатать время по фазам каждого обновления (нужен EINK_DIAG)" OFF)
 
 option(EINK_POWER_TEST "Вместо демо собрать тест замера тока мультиметром (demo/eink_power_test.c, см. Docs/POWER_TEST.md)" OFF)
@@ -91,6 +95,9 @@ if(EINK_POWER_TEST)
     )
 else()
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../demo/eink_demo.c)
+    if(EINK_HAT_SLEEP)
+        target_sources(${CMAKE_PROJECT_NAME} PRIVATE Core/Src/eink_pwr.c)
+    endif()
 endif()
 
 # Add include paths
@@ -107,6 +114,10 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     EINK_DIAG=$<BOOL:${EINK_DIAG}>
     EINK_PROFILE=$<BOOL:${EINK_PROFILE}>
     EINK_SLEEP=$<BOOL:${EINK_SLEEP}>
+    EINK_HAT_SLEEP=$<BOOL:${EINK_HAT_SLEEP}>
+    EINK_UPDATE_PERIOD_MS=${EINK_UPDATE_PERIOD_MS}
+    EINK_BW_PERIOD_MS=${EINK_BW_PERIOD_MS}
+    EINK_BW_EVERY=${EINK_BW_EVERY}
     EINK_DEBUG_USART=${EINK_DEBUG_USART}
     # Настройки библиотеки (все необязательные, значения по умолчанию - в epd4g/include/epd4g_config.h):
     # EPD4G_KEEP_POWER=0
