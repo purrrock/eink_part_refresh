@@ -18,12 +18,13 @@
  * стоит в 0 (как сейчас). HIGH - SPI1 выключен, SCK/MOSI/DC = 1. ANALOG - SPI1 выключен, SCK/MOSI/DC
  * в analog (CS и RST остаются выходами: библиотека держит RST низким в импульсе сброса).
  *
- *   HAT-PWR (PWR_GROUPS & 8) мини-тест «какая линия обесточивает HAT»: панель в power off, Stop 2,
- *           все линии в 1, а одна из них (RST, CS, BUSY, DC, SCK+MOSI) в 0 или в analog. После замера
+ *   HAT-PWR (PWR_GROUPS & 8 и & 16) мини-тесты «что обесточивает HAT»: панель в power off, Stop 2,
+ *           режим каждой линии задаёт таблица HAT_VAR (группа 8: одна линия в analog/0, остальные в 1;
+ *           группа 16: RST в 0 и разные комбинации остальных). После замера
  *           8 с на осмотр экрана (сохранилась ли картинка), затем время повторного init и полного обновления.
  *
  * Параметры (-D... в CMake): PWR_DWELL_STATIC_S, PWR_DWELL_DYN_S, PWR_ANALOG_ON_MAX_S, PWR_GROUPS (маска:
- * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 HAT-PWR), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
+ * 1 STATIC, 2 DYN-4G, 4 DYN-1B, 8 и 16 HAT-PWR), PWR_FIRST_STEP, PWR_LAST_STEP, PWR_TEST_BW_KEEP.
  */
 #define EINK_POWER_TEST 1
 #include "eink_demo.c"
@@ -77,16 +78,34 @@ static const char *const CPU_NAME[]   = { "RUN", "SLEEP", "STOP2" };
 static const char *const LINES_NAME[] = { "ACTIVE", "LOW", "HIGH", "ANALOG" };      /* индекс = pwr_lines_t */
 static const char *const PANEL_NAME[] = { "ANALOG ON", "ANALOG OFF", "DEEP SLEEP" };
 
-/* Варианты HAT-PWR: какая линия и в каком состоянии (остальные в 1). */
-static const struct { pwr_pin_t pin; pwr_pinmode_t mode; const char *name; } HAT_VAR[] = {
-    { PWR_PIN_DC,   PWR_PIN_HIGH,   "ALL HIGH"        },
-    { PWR_PIN_RST,  PWR_PIN_LOW,    "RST LOW"         },
-    { PWR_PIN_RST,  PWR_PIN_ANALOG, "RST ANALOG"      },
-    { PWR_PIN_CS,   PWR_PIN_ANALOG, "CS ANALOG"       },
-    { PWR_PIN_BUSY, PWR_PIN_ANALOG, "BUSY ANALOG"     },
-    { PWR_PIN_DC,   PWR_PIN_ANALOG, "DC ANALOG"       },
-    { PWR_PIN_SPI,  PWR_PIN_ANALOG, "SCK MOSI ANALOG" },
+/* Варианты HAT-PWR: режим каждой линии. Порядок: RST, CS, DC, BUSY, SPI (SCK+MOSI).
+ * BUSY - вход: L/H оставляют его цифровым входом, A отключает. Первые 7 - группа 8, остальные - группа 16. */
+#define L PWR_PIN_LOW
+#define H PWR_PIN_HIGH
+#define A PWR_PIN_ANALOG
+static const struct { const char *name; uint8_t m[5]; } HAT_VAR[] = {
+    /* группа 8: одна линия отличается, остальные в 1 */
+    { "ALL HIGH",          { H, H, H, H, H } },
+    { "RST LOW",           { L, H, H, H, H } },
+    { "RST ANALOG",        { A, H, H, H, H } },
+    { "CS ANALOG",         { H, A, H, H, H } },
+    { "BUSY ANALOG",       { H, H, H, A, H } },
+    { "DC ANALOG",         { H, H, A, H, H } },
+    { "SCK MOSI ANALOG",   { H, H, H, H, A } },
+    /* группа 16: RST в 0 / analog, остальные подобраны так, чтобы не подпитывать HAT через линии */
+    { "ALL ANALOG",        { A, A, A, A, A } },
+    { "RST0 REST 0",       { L, L, L, A, L } },
+    { "RST0 REST ANALOG",  { L, A, A, A, A } },
+    { "RST0 CS1 REST AN",  { L, H, A, A, A } },
+    { "RST0 DC1 REST AN",  { L, A, H, A, A } },
+    { "RST0 SPI1 REST AN", { L, A, A, A, H } },
+    { "RST0 BIN REST AN",  { L, A, A, L, A } },
 };
+#undef L
+#undef H
+#undef A
+#define HAT_N_G8   7
+#define HAT_N_ALL  ((int)ARRAY_N(HAT_VAR))
 
 static void add_step(int grp, int panel, int lines, int cpu)
 {
@@ -121,7 +140,11 @@ static void build_steps(void)
             add_step(GRP_DYNBW, PWR_TEST_BW_KEEP, LINES_DYN[l], CPUS[c]);
 #endif
 #if PWR_GROUPS & 8
-    for (int v = 0; v < ARRAY_N(HAT_VAR); v++)
+    for (int v = 0; v < HAT_N_G8; v++)
+        add_step(GRP_HAT, 0, v, PWR_CPU_STOP2);
+#endif
+#if PWR_GROUPS & 16
+    for (int v = HAT_N_G8; v < HAT_N_ALL; v++)
         add_step(GRP_HAT, 0, v, PWR_CPU_STOP2);
 #endif
 }
@@ -326,7 +349,11 @@ static int step_hat(const step_t *s, int num)
         return rc;
 
     pwr_lines_set(PWR_LINES_HIGH, 0);
-    pwr_pin_set(HAT_VAR[s->lines].pin, HAT_VAR[s->lines].mode);
+    {
+        static const pwr_pin_t PINS[5] = { PWR_PIN_RST, PWR_PIN_CS, PWR_PIN_DC, PWR_PIN_BUSY, PWR_PIN_SPI };
+        for (int i = 0; i < 5; i++)
+            pwr_pin_set(PINS[i], (pwr_pinmode_t)HAT_VAR[s->lines].m[i]);
+    }
     DIAG("[HOLD] %d s, measure now\r\n", hold_s);
     pwr_quiet(1);
     hold(PWR_CPU_STOP2, (uint32_t)hold_s * 1000U);
